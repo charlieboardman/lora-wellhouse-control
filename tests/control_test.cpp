@@ -1,62 +1,110 @@
 #include <cassert>
 #include <cstdio>
 #include <initializer_list>
-#include "../firmware/receiver/control.h"
-#include "../firmware/sender/sender_logic.h"
-
+#include "../firmware/gateway/receiver.c"
+static gw_packet command(uint8_t kind, uint32_t id) {
+    gw_packet p = {};
+    p.kind = kind;
+    p.session = 123;
+    p.receiver_boot = 456;
+    p.transaction = id;
+    return p;
+}
+static void hello(gw_receiver &r, uint64_t now) {
+    gw_packet p = command(GW_HELLO, 1), o;
+    assert(gw_receiver_request(&r, &p, now * 1000, &o) == 1);
+}
 int main() {
-    constexpr uint8_t packet[]={ON_PACKET_BYTES};
-    static_assert(sizeof(packet)==ON_PACKET_SIZE);
-    // 32-bit timer boundaries and >20 years uptime, using the actual shared logic.
-    for(uint64_t base : {0ULL,2147483640ULL,4294967290ULL,631152000000ULL}) {
-        sender_schedule_t s; sender_schedule_init(&s,base);
-        assert(!sender_take_slot(&s,base));
-        assert(!sender_take_slot(&s,base+9999));
-        assert(sender_take_slot(&s,base+10000));
-        assert(!sender_take_slot(&s,base+10001));
-        assert(sender_take_slot(&s,base+70000)); // Stalled CPU: one sample, no catch-up burst.
-        assert(!sender_take_slot(&s,base+70000));
-        assert(!sender_take_slot(&s,base+79999));
-        assert(sender_take_slot(&s,base+80000));
-        Control c;
-        assert(!c.on);
-        assert(c.accept(packet,sizeof(packet),base));
-        c.tick(base+30999);assert(c.on);
-        c.tick(base+31000);assert(!c.on);
-        assert(c.accept(packet,sizeof(packet),base));
-        assert(c.accept(packet,sizeof(packet),base+30000)); // Two lost 10s heartbeats tolerated.
-        c.tick(base+31000);assert(c.on);
-        const uint64_t deadline=c.deadline;
-        uint8_t bad[ON_PACKET_SIZE+1]={};memcpy(bad,packet,sizeof(packet));
-        for(size_t i=0;i<sizeof(packet);++i) {
-            bad[i]^=1; // Includes legacy OFF byte 0.
-            assert(!c.accept(bad,sizeof(packet),base+60000));
-            assert(c.deadline==deadline);
-            bad[i]^=1;
-        }
-        for(size_t n=0;n<sizeof(packet);++n) assert(!c.accept(packet,n,base+60000));
-        assert(!c.accept(bad,sizeof(bad),base+60000));
-        bad[sizeof(packet)-1]=2;assert(!c.accept(bad,sizeof(packet),base+60000));
-        c.tick(base+61000);assert(!c.on);
-        bad[sizeof(packet)-1]=0;assert(!c.accept(bad,sizeof(packet),base+62000));assert(!c.on);
-        c.accept(packet,sizeof(packet),base+70000);c.fail();assert(!c.on);
+    for (uint64_t base : {0ULL, 4294967290ULL, 631152000000ULL}) {
+        gw_receiver r;
+        gw_receiver_init(&r, 456);
+        hello(r, base);
+        gw_packet p = command(GW_ON, 2), o;
+        assert(gw_receiver_request(&r, &p, base * 1000, &o) == 1);
+        assert(r.on);
+        gw_receiver_tick(&r, base + 129999);
+        assert(r.on);
+        gw_receiver_tick(&r, base + 130000);
+        assert(!r.on);
+        p = command(GW_ON, 3);
+        gw_receiver_request(&r, &p, (base + 140000) * 1000, &o);
+        assert(r.on);
+        uint64_t deadline = r.relay_until_ms;
+        gw_receiver_request(&r, &p, (base + 150000) * 1000, &o);
+        assert(r.relay_until_ms == deadline);
+        p = command(GW_PAUSE, 4);
+        p.length = 8;
+        gw_put64(p.data, PAUSE_MS);
+        gw_receiver_request(&r, &p, (base + 160000) * 1000, &o);
+        assert(!r.on);
+        uint64_t expiry = r.pause_until_ms;
+        gw_receiver_request(&r, &p, (base + 170000) * 1000, &o);
+        assert(r.pause_until_ms == expiry);
+        p = command(GW_ON, 5);
+        gw_receiver_request(&r, &p, (base + 180000) * 1000, &o);
+        assert(!r.on);
+        gw_receiver_tick(&r, expiry);
+        assert(!r.on);
+        p = command(GW_ON, 6);
+        gw_receiver_request(&r, &p, expiry * 1000, &o);
+        assert(r.on);
+        p = command(GW_PAUSE, 7);
+        p.length = 8;
+        gw_put64(p.data, PAUSE_MS);
+        gw_receiver_request(&r, &p, (expiry + 1) * 1000, &o);
+        p = command(GW_RESUME, 8);
+        gw_receiver_request(&r, &p, (expiry + 2) * 1000, &o);
+        assert(!r.on && !r.pause_until_ms);
+        p = command(GW_ON, 6);
+        gw_receiver_request(&r, &p, (expiry + 3) * 1000, &o);
+        assert(!r.on);
+        p = command(GW_ON, 9);
+        gw_receiver_request(&r, &p, (expiry + 4) * 1000, &o);
+        assert(r.on);
+        gw_receiver_fail(&r);
+        assert(!r.on);
+        gw_receiver_init(&r, 789);
+        assert(!r.on && !r.pause_until_ms && !r.clock.valid);
     }
-    assert(!sender_should_transmit(false,false));
-    assert(!sender_should_transmit(false,true));
-    assert(!sender_should_transmit(true,false));
-    assert(sender_should_transmit(true,true));
+    // A new sender session resets communication identity, not physical control.
+    gw_receiver r;
+    gw_receiver_init(&r, 456);
+    hello(r, 0);
+    gw_packet p = command(GW_ON, 2), o;
+    gw_receiver_request(&r, &p, 1000, &o);
+    const uint64_t relay_deadline = r.relay_until_ms;
+    r.control_id = 3;
+    r.modbus_id = 4;
+    r.clock_id = 5;
+    r.cache.valid = true;
+    r.serial_pending = true;
+    r.clock.valid = true;
+    r.clock.offset_us = 123456;
+    p = command(GW_HELLO, 1);
+    p.session = 124;
+    assert(gw_receiver_request(&r, &p, 2000, &o) == 1);
+    assert(r.session == 124 && r.on && r.relay_until_ms == relay_deadline);
+    assert(!r.control_id && !r.on_id && !r.modbus_id && !r.clock_id);
+    assert(!r.cache.valid && !r.serial_pending);
+    assert(r.clock.valid && r.clock.offset_us == 123456);
 
-    // Integrated timing simulation: uninterrupted ON, then silence with no OFF frames.
-    sender_schedule_t schedule;sender_schedule_init(&schedule,0);
-    Control receiver;
-    unsigned sends=0;
-    for(uint64_t t=0;t<=100000;t++) {
-        if(sender_take_slot(&schedule,t) && sender_should_transmit(t<=60000,true)) {
-            assert(receiver.accept(packet,sizeof(packet),t));++sends;
-        }
-        receiver.tick(t);
-        assert(receiver.on==(t>=10000 && t<91000));
-    }
-    assert(sends==6);
-    puts("PASS scheduled ON-only TX, silence timeout, renewal, rejected OFF/invalid frames, fault-off, 20-year timers");
+    p = command(GW_PAUSE, 2);
+    p.session = 124;
+    p.length = 8;
+    gw_put64(p.data, PAUSE_MS);
+    gw_receiver_request(&r, &p, 3000, &o);
+    const uint64_t pause_deadline = r.pause_until_ms;
+    p = command(GW_HELLO, 1);
+    p.session = 125;
+    gw_receiver_request(&r, &p, 4000, &o);
+    assert(!r.on && r.pause_until_ms == pause_deadline);
+    // A repeated HELLO in the same session must not erase duplicate tracking.
+    r.control_id = 9;
+    r.cache.valid = true;
+    gw_receiver_request(&r, &p, 5000, &o);
+    assert(r.control_id == 9 && r.cache.valid);
+    gw_receiver_fail(&r);
+    assert(!r.on && !r.relay_until_ms && r.pause_until_ms == pause_deadline);
+    puts("PASS receiver timing, duplicate commands, resume, reboot, session boundaries, fail-off, "
+         "large timestamps");
 }

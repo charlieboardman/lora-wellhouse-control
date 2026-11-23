@@ -1,105 +1,232 @@
-// Execute the actual sender loop with a simulated clock/radio. No test hooks
-// are compiled into the production firmware.
 #include <cassert>
 #include <cstdio>
 #include <vector>
-#include "../firmware/receiver/control.h"
-static int test_printf(const char *, ...);
-#define printf test_printf
-#define main sender_firmware_main
-#include "../firmware/sender/main.c"
-#undef main
-#undef printf
-
-struct End { bool reboot; };
-static uint64_t clock_ms, base_ms, fed_ms, last_tx_end;
-static bool permanent_failure, failed_refresh, enabled;
-static unsigned init_calls, successes, tx_count;
-static std::vector<uint64_t> samples, refreshes;
-static Control receiver;
-static constexpr uint8_t packet[] = {ON_PACKET_BYTES};
-
-static void advance(unsigned n) {
-    clock_ms += n;
-    receiver.tick(clock_ms);
-    assert(enabled && clock_ms-fed_ms < WATCHDOG_MS);
-    // A failed refresh must not interrupt an otherwise continuous ON lease.
-    if (!permanent_failure && tx_count && clock_ms-base_ms < SENDER_RADIO_REFRESH_MS+20000)
-        assert(receiver.on);
+#include "../firmware/gateway/sender.c"
+#include "../firmware/gateway/receiver.c"
+static unsigned deliveries, controls;
+static uint8_t last_error;
+static bool confirmed;
+static std::vector<uint8_t> delivered;
+void gw_deliver(uint32_t, uint16_t, const uint8_t *p, size_t n, uint8_t error) {
+    ++deliveries;
+    last_error = error;
+    delivered.assign(p, p + n);
 }
-uint64_t time_us_64(void) { return clock_ms*1000; }
-void gpio_init(unsigned pin) { assert(pin==FLOAT_GPIO); }
-void gpio_set_dir(unsigned, bool output) { assert(!output); }
-void gpio_pull_up(unsigned) {}
-bool gpio_get(unsigned pin) {
-    assert(pin==FLOAT_GPIO);
-    samples.push_back(clock_ms);
-    // First maintenance is during ON; the next is during silence.
-    return clock_ms-base_ms >= SENDER_RADIO_REFRESH_MS+20000;
+void gw_control_done(uint32_t, bool ok) {
+    ++controls;
+    confirmed = ok;
 }
-void stdio_init_all(void) {}
-void sleep_ms(unsigned n) {
-    advance(n);
-    if(clock_ms-base_ms >= 2*SENDER_RADIO_REFRESH_MS+60000) throw End{false};
-}
-void tight_loop_contents(void) { assert(false); }
-int cyw43_arch_init(void) { return 0; }
-void cyw43_arch_gpio_put(unsigned, bool) {}
-void watchdog_enable(unsigned timeout, bool pause) {
-    assert(timeout==8000 && !pause); enabled=true;fed_ms=clock_ms;
-}
-bool watchdog_caused_reboot(void) { return false; }
-void watchdog_update(void) { fed_ms=clock_ms; }
-void watchdog_reboot(unsigned pc, unsigned sp, unsigned delay) {
-    assert(!pc && !sp && delay==10); throw End{true};
-}
-void radio_gpio_init(void) {}
-void radio_abort(void) {}
-bool radio_healthy(void) { return true; }
-bool radio_init(void) {
-    ++init_calls;
-    if(!permanent_failure && init_calls>1) {
-        assert(!samples.empty());
-        assert(clock_ms>=last_tx_end); // Never reset during a packet.
-        refreshes.push_back(clock_ms);
+static gw_sender s;
+static gw_receiver r;
+static uint64_t now;
+static void exchange(gw_packet p, bool lose = false) {
+    gw_packet o = {};
+    int action = gw_receiver_request(&r, &p, now * 1000, &o);
+    assert(action == 1);
+    if (!lose) {
+        assert(gw_sender_reply(&s, &o, now * 1000));
+    } else {
+        gw_sender_timeout(&s, now);
     }
-    advance(75); // Initialization consumes time; scheduling must tolerate it.
-    if(permanent_failure) return false;
-    if(init_calls==2) {failed_refresh=true;return false;}
-    ++successes;return true;
 }
-bool radio_send_on(void) {
-    assert(!samples.empty() && clock_ms==samples.back());
-    advance(1200);
-    last_tx_end=clock_ms;
-    assert(receiver.accept(packet,sizeof(packet),clock_ms));
-    ++tx_count;return true;
+static gw_packet next(void) {
+    gw_packet p = {};
+    assert(gw_sender_next(&s, now, &p));
+    return p;
 }
-static int test_printf(const char *, ...) { return 0; }
-
-static void run(uint64_t base, bool fail) {
-    clock_ms=base_ms=fed_ms=base;last_tx_end=0;
-    permanent_failure=fail;failed_refresh=enabled=false;
-    init_calls=successes=tx_count=0;receiver=Control{};
-    samples.clear();refreshes.clear();led_available=led_state=false;
-    try {sender_firmware_main();assert(false);}
-    catch(const End &end) {assert(end.reboot==fail);}
-    if(fail) {assert(init_calls==MAX_INIT_FAILURES && tx_count==0);return;}
-    assert(failed_refresh && init_calls==4 && successes==3);
-    assert(refreshes.size()==3);
-    assert(refreshes[0]>=base+SENDER_RADIO_REFRESH_MS);
-    assert(refreshes[1]-refreshes[0]>=RADIO_RETRY_MS+75);
-    assert(refreshes[2]-refreshes[1]>=SENDER_RADIO_REFRESH_MS);
-    assert(samples.front()==base+SAMPLE_INTERVAL_MS);
-    for(size_t i=1;i<samples.size();i++)
-        assert(samples[i]-samples[i-1]==SAMPLE_INTERVAL_MS);
-    assert(tx_count==(SENDER_RADIO_REFRESH_MS+20000)/SAMPLE_INTERVAL_MS-1);
-    assert(!receiver.on && !led_state);
+static void init(void) {
+    now = 0;
+    deliveries = controls = 0;
+    last_error = 0;
+    gw_sender_init(&s, 123, now);
+    gw_receiver_init(&r, 456);
+    exchange(next());
+    s.sync_pending = false;
+}
+static void serial_response(gw_packet p, bool large, bool lose) {
+    gw_packet o = {};
+    assert(gw_receiver_request(&r, &p, now * 1000, &o) == 2);
+    uint8_t frame[256] = {1, p.data[1]};
+    size_t n = large ? 254 : 27;
+    for (size_t i = 2; i < n; i++) {
+        frame[i] = (uint8_t)i;
+    }
+    if (p.data[1] == 3) {
+        frame[2] = 24;
+    }
+    uint16_t crc = gw_crc(frame, n);
+    frame[n++] = (uint8_t)crc;
+    frame[n++] = (uint8_t)(crc >> 8);
+    gw_receiver_serial_done(&r, frame, n, now * 1000, &o);
+    if (lose) {
+        gw_sender_timeout(&s, now);
+    } else {
+        assert(gw_sender_reply(&s, &o, now * 1000));
+    }
 }
 int main() {
-    static_assert(TX_POWER_DBM==22 && LORA_SF==12 && LORA_BW_CODE==4 && LORA_CR_CODE==4);
-    run(0,false);
-    run(UINT64_C(631152000000),false);
-    run(0,true);
-    puts("PASS actual sender loop: hourly refresh during ON/silence, failed-refresh recovery, unchanged 10s cadence, no extra TX, repeated-failure reboot, full-power settings");
+    const uint8_t read[] = {1, 3, 0x21, 0, 0, 12}, vendor[] = {1, 0x41};
+    gw_packet p, o;
+    init();
+    assert(!gw_sender_submit(&s, 1, 10, vendor, sizeof(vendor), now));
+    p = next();
+    assert(p.kind == GW_REQUEST);
+    serial_response(p, true, false);
+    assert(s.fetching);
+    now = 30000;
+    gw_sender_sample(&s, true, now);
+    p = next();
+    assert(p.kind == GW_ON);
+    exchange(p);
+    assert(r.on);
+    p = next();
+    assert(p.kind == GW_FETCH && p.piece == 0);
+    exchange(p, true);
+    p = next();
+    assert(p.kind == GW_FETCH && p.piece == 0);
+    exchange(p);
+    p = next();
+    assert(p.kind == GW_FETCH && p.piece == 1);
+    exchange(p);
+    assert(deliveries == 1 && !last_error && delivered.size() == 254 && !s.active);
+    // Lost execution response reuses receiver cache, including after pump control.
+    assert(!gw_sender_submit(&s, 1, 11, read, sizeof(read), now));
+    p = next();
+    serial_response(p, false, true);
+    assert(gw_sender_control(&s, true, 99, now));
+    o = next();
+    assert(o.kind == GW_PAUSE);
+    exchange(o);
+    o = next();
+    assert(o.kind == GW_REQUEST && o.transaction == p.transaction);
+    exchange(o);
+    assert(deliveries == 2 && r.cache.transaction == p.transaction && !r.on);
+    // Pause acknowledgement loss cannot extend expiry, and resume requires fresh ON.
+    init();
+    now = 30000;
+    gw_sender_sample(&s, true, now);
+    exchange(next());
+    assert(gw_sender_control(&s, true, 99, now));
+    p = next();
+    exchange(p, true);
+    uint64_t expiry = r.pause_until_ms;
+    now += 1000;
+    p = next();
+    exchange(p);
+    assert(r.pause_until_ms == expiry && confirmed);
+    assert(gw_sender_control(&s, false, 99, now));
+    exchange(next());
+    assert(!r.on);
+    exchange(next());
+    assert(r.on);
+    // A pause lost before reception retries only the remaining duration.
+    init();
+    assert(gw_sender_control(&s, true, 99, now));
+    p = next();
+    gw_sender_timeout(&s, now);
+    now = 1000;
+    p = next();
+    assert(gw_get64(p.data) == PAUSE_MS - now);
+    exchange(p);
+    assert(r.pause_until_ms == PAUSE_MS);
+    // A receiver reboot cannot replay an uncertain write.
+    init();
+    assert(!gw_sender_submit(&s, 1, 12, read, sizeof(read), now));
+    p = next();
+    serial_response(p, false, true);
+    gw_receiver_init(&r, 789);
+    p = next();
+    exchange(p);
+    assert(deliveries == 1 && last_error == 11 && !s.active);
+    assert(s.peer == 0);
+    exchange(next());
+    assert(s.peer == 789);
+    // A failed priority ON may force a handshake while a write retry waits.
+    // Remember the old receiver boot even after peer is cleared for reconnect.
+    init();
+    assert(!gw_sender_submit(&s, 1, 12, read, sizeof(read), now));
+    p = next();
+    serial_response(p, false, true);
+    now = 30000;
+    gw_sender_sample(&s, true, now);
+    p = next();
+    assert(p.kind == GW_ON);
+    gw_sender_timeout(&s, now);
+    assert(!s.peer && s.active);
+    gw_receiver_init(&r, 789);
+    exchange(next());
+    assert(deliveries == 1 && last_error == 11 && !s.active && !s.retry_pending);
+    // Invalid ACKs cannot report a confirmed control operation.
+    init();
+    assert(gw_sender_control(&s, true, 99, now));
+    p = next();
+    assert(gw_receiver_request(&r, &p, now * 1000, &o) == 1);
+    o.length = 0;
+    assert(!gw_sender_reply(&s, &o, now * 1000) && !controls);
+    // Bad clock measurements back off and allow queued Modbus work through.
+    init();
+    gw_sender_ntp(&s, 0, UINT64_C(1800000000000000));
+    p = next();
+    gw_sender_sent(&s, 1000000);
+    assert(gw_receiver_request(&r, &p, 1001000, &o) == 1);
+    gw_put64(o.data + 8, 4000000);
+    assert(gw_sender_reply(&s, &o, 9000000));
+    now = 9000;
+    assert(s.sync_pending && s.sync_retry_ms > now);
+    assert(!gw_sender_submit(&s, 1, 12, read, sizeof(read), now));
+    p = next();
+    assert(p.kind == GW_REQUEST);
+    // Bounded queue, single-packet request cap, and two timeouts release the job.
+    init();
+    uint8_t large[GW_DATA_MAX + 1] = {1, 3};
+    assert(gw_sender_submit(&s, 1, 1, large, sizeof(large), now) == 3);
+    for (unsigned i = 0; i < GW_QUEUE_SIZE; i++) {
+        assert(!gw_sender_submit(&s, 1, (uint16_t)i, read, sizeof(read), now));
+    }
+    assert(gw_sender_submit(&s, 1, 1, read, sizeof(read), now) == 6);
+    p = next();
+    gw_sender_timeout(&s, now);
+    p = next();
+    gw_sender_timeout(&s, now);
+    assert(deliveries == 1 && last_error == 11);
+    // Retry handshake, then reject stale responses without releasing the active slot.
+    init();
+    s.peer = 0;
+    p = next();
+    gw_sender_timeout(&s, now);
+    o = next();
+    assert(o.transaction == p.transaction);
+    exchange(o);
+    assert(!gw_sender_submit(&s, 1, 3, read, sizeof(read), now));
+    p = next();
+    o = p;
+    o.kind = GW_RESULT;
+    ++o.transaction;
+    assert(!gw_sender_reply(&s, &o, now * 1000) && s.have_out);
+    // Clock exchange uses TX/RX end timestamps, excluding airtime and scheduling.
+    init();
+    uint64_t utc = UINT64_C(1800000000000000);
+    gw_sender_ntp(&s, 0, utc);
+    p = next();
+    assert(p.kind == GW_SYNC);
+    gw_sender_sent(&s, 1000000);
+    assert(gw_receiver_request(&r, &p, 1001000, &o) == 1);
+    gw_put64(o.data + 8, 4000000);
+    assert(gw_sender_reply(&s, &o, 4001000));
+    assert(s.correction_pending);
+    now = 5000;
+    p = next();
+    assert(p.kind == GW_CORRECTION);
+    exchange(p);
+    assert(r.clock.valid && r.clock.offset_us == (int64_t)utc);
+    // Sample-open cancellation while a request waits; no catch-up ON burst.
+    init();
+    now = 30000;
+    gw_sender_sample(&s, true, now);
+    assert(s.on_pending);
+    gw_sender_sample(&s, false, now + 1000);
+    assert(!s.on_pending);
+    assert(!gw_sender_next(&s, now + 1000, &p));
+    puts("PASS sender/receiver execution: priority ON, cached writes, piece retries, session "
+         "resets, queue bounds, time sync, stale replies");
 }

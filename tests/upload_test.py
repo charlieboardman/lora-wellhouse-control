@@ -1,6 +1,7 @@
 """Exercise upload guards without connecting to hardware."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +11,8 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('upload', Path(__file__).resolve().parents[1] / 'scripts/upload.py')
 upload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(upload)
+
+TEST_MAC = 'aa:bb:cc:dd:ee:ff'
 
 
 class UploadGuards(unittest.TestCase):
@@ -35,16 +38,24 @@ class UploadGuards(unittest.TestCase):
         upload.upload_sender(self.build, str(self.root))
         self.assertEqual((self.root / 'well_sender.uf2').read_bytes(), b'firmware')
 
+    @patch.dict(os.environ, {}, clear=True)
+    @patch.object(upload.subprocess, 'run')
+    def test_missing_receiver_mac_refuses_to_flash(self, run):
+        with self.assertRaisesRegex(RuntimeError, 'RECEIVER_MAC is not configured'):
+            upload.upload_receiver(self.root, self.build, 'test-port')
+        run.assert_not_called()
+
     @patch.object(upload.subprocess, 'run')
     def test_wrong_receiver_never_reads_or_writes_flash(self, run):
         run.return_value = subprocess.CompletedProcess([], 0, stdout='MAC: 00:00:00:00:00:00')
         with self.assertRaisesRegex(RuntimeError, 'Wrong receiver'):
-            upload.upload_receiver(self.root, self.build, 'test-port')
+            upload.upload_receiver(self.root, self.build, 'test-port', expected_mac=TEST_MAC)
         self.assertEqual(run.call_count, 1)
 
     @patch.object(upload.subprocess, 'run')
     def test_incomplete_backup_prevents_flash_write(self, run):
-        run.return_value = subprocess.CompletedProcess([], 0, stdout='MAC: ' + upload.RECEIVER_MAC)
+        (self.root / 'upload.local.json').write_text(json.dumps({'receiver_mac': TEST_MAC}))
+        run.return_value = subprocess.CompletedProcess([], 0, stdout='MAC: ' + TEST_MAC)
         backups = self.root / '.backups'
         backups.mkdir()
         (backups / 'receiver-before.bin').write_bytes(b'incomplete')
@@ -56,7 +67,7 @@ class UploadGuards(unittest.TestCase):
     def test_unexpected_offsets_prevent_device_access(self, run):
         (self.build / 'flasher_args.json').write_text('{"flash_files": {"0x20000": "firmware.bin"}}')
         with self.assertRaisesRegex(RuntimeError, 'Unexpected flash offsets'):
-            upload.upload_receiver(self.root, self.build, 'test-port')
+            upload.upload_receiver(self.root, self.build, 'test-port', expected_mac=TEST_MAC)
         run.assert_not_called()
 
 

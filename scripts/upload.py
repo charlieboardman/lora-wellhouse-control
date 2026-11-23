@@ -7,10 +7,28 @@ import shutil
 import subprocess
 import sys
 
-RECEIVER_MAC = 'xx:xx:xx:xx:xx:xx'
+
+def load_local_config(root):
+    path = Path(root) / 'upload.local.json'
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text())
+
+
+def resolve_setting(root, env_key, json_key, cli_value=''):
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env_value = os.environ.get(env_key, '').strip()
+    if env_value:
+        return env_value
+    return str(load_local_config(root).get(json_key, '')).strip()
 
 
 def upload_sender(build, port):
+    if not port:
+        raise RuntimeError(
+            'Sender upload port is not configured; set SENDER_UPLOAD_PORT or upload.local.json'
+        )
     mount = Path(port)
     if 'Board-ID: RP2350' not in (mount / 'INFO_UF2.TXT').read_text():
         raise RuntimeError('Not an RP2350 BOOTSEL drive; refusing to flash')
@@ -22,7 +40,20 @@ def upload_sender(build, port):
         os.fsync(dst.fileno())
 
 
-def upload_receiver(root, build, port):
+def upload_receiver(root, build, port, expected_mac=None):
+    if not port:
+        raise RuntimeError(
+            'Receiver upload port is not configured; set RECEIVER_UPLOAD_PORT or upload.local.json'
+        )
+    mac = (
+        expected_mac.strip().lower()
+        if expected_mac is not None
+        else resolve_setting(root, 'RECEIVER_MAC', 'receiver_mac').lower()
+    )
+    if not mac or mac == 'xx:xx:xx:xx:xx:xx':
+        raise RuntimeError(
+            'RECEIVER_MAC is not configured; set RECEIVER_MAC or upload.local.json'
+        )
     files = {'0x0': 'bootloader.bin', '0x8000': 'partitions.bin', '0x10000': 'firmware.bin'}
     flash = json.loads((build / 'flasher_args.json').read_text())
     if set(flash['flash_files']) != set(files):
@@ -34,7 +65,7 @@ def upload_receiver(root, build, port):
             '--before', 'default-reset']
     identity = subprocess.run(base + ['--after', 'no-reset', 'read-mac'], check=True,
                               capture_output=True, text=True, timeout=45)
-    if RECEIVER_MAC not in identity.stdout.lower():
+    if mac not in identity.stdout.lower():
         raise RuntimeError('Wrong receiver; refusing to flash: ' + identity.stdout)
     backups = root / '.backups'
     backups.mkdir(exist_ok=True)
@@ -55,10 +86,12 @@ def upload_receiver(root, build, port):
 def upload(source, target, env):
     root = Path(env.subst('$PROJECT_DIR'))
     build = Path(env.subst('$BUILD_DIR'))
-    port = env.subst('$UPLOAD_PORT')
+    cli_port = env.subst('$UPLOAD_PORT')
     if env.subst('$PIOENV') == 'sender':
+        port = resolve_setting(root, 'SENDER_UPLOAD_PORT', 'sender_port', cli_port)
         upload_sender(build, port)
     else:
+        port = resolve_setting(root, 'RECEIVER_UPLOAD_PORT', 'receiver_port', cli_port)
         upload_receiver(root, build, port)
 
 

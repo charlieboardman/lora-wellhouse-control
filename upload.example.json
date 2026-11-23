@@ -1,0 +1,5 @@
+{
+  "sender_port": "/run/media/YOUR_USER/RP2350",
+  "receiver_port": "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_XX:XX:XX:XX:XX:XX-if00",
+  "receiver_mac": "xx:xx:xx:xx:xx:xx"
+}

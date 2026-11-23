@@ -24,12 +24,12 @@ if ! "$python" - <<'PY'
 from importlib.metadata import version, PackageNotFoundError
 try:
     assert all(version(name) == expected for name, expected in (
-        ('platformio', '6.2.0'), ('esptool', '5.6.0'), ('ziglang', '0.17.1')))
+        ('platformio', '6.2.0'), ('esptool', '5.6.0'), ('ziglang', '0.17.1'), ('pymodbus', '3.16.2')))
 except (AssertionError, PackageNotFoundError):
     raise SystemExit(1)
 PY
 then
-    "$python" -m pip install platformio==6.2.0 esptool==5.6.0 ziglang==0.17.1
+    "$python" -m pip install platformio==6.2.0 esptool==5.6.0 ziglang==0.17.1 pymodbus==3.16.2
 fi
 export ZIG_GLOBAL_CACHE_DIR="$root/.build/zig-global"
 export ZIG_LOCAL_CACHE_DIR="$root/.build/zig-local"
@@ -47,8 +47,12 @@ import sys
 mode, board = sys.argv[1:]
 root = Path.cwd()
 core = Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home() / '.platformio')).expanduser()
-inputs = [root / 'deploy.sh', root / 'platformio.ini', root / 'firmware/config.h']
+inputs = [root / 'deploy.sh', root / 'platformio.ini', root / 'firmware/config.h',
+          root / 'firmware/wifi.example.h', root / '.build/link_id.h']
+if board == 'sender':
+    inputs += [root / 'firmware/wifi.local.h']
 inputs += sorted((root / 'firmware' / board).rglob('*'))
+inputs += sorted((root / 'firmware/gateway').rglob('*'))
 if board == 'receiver':
     inputs += [root / 'CMakeLists.txt', root / 'firmware/CMakeLists.txt']
 def fingerprint(paths):
@@ -99,14 +103,64 @@ PY
 
 echo 'Checking firmware and upload behavior...'
 mkdir -p .build/tests
-for suite in control sender_runtime; do
+for suite in control sender_runtime gateway radio; do
     "$python" -m ziglang c++ -std=c++17 -Wall -Wextra -Werror \
-        -fsanitize=undefined -I"$root/tests/stubs" "tests/${suite}_test.cpp" \
+        -DGW_LINK_ID='UINT64_C(0x1)' -fsanitize=undefined "tests/${suite}_test.cpp" \
         -o ".build/tests/${suite}_test"
     ".build/tests/${suite}_test"
 done
 "$python" tests/upload_test.py
+"$python" -m ziglang c++ -std=c++17 -Wall -Wextra -Werror -DGW_LINK_ID='UINT64_C(0x1)' \
+    -fsanitize=undefined tests/interop_host.cpp -o .build/tests/interop_host
+"$python" tests/interop_test.py
 [[ "$command_name" != test ]] || exit 0
+
+"$python" - "$command_name" <<'PY'
+import os
+from pathlib import Path
+import secrets
+import sys
+
+command = sys.argv[1]
+target = Path('.build/link_id.h')
+raw = os.environ.get('GW_LINK_ID', '').strip()
+
+def parse_link_id(text):
+    cleaned = text.strip().lower()
+    if cleaned.startswith('0x'):
+        cleaned = cleaned[2:]
+    if not cleaned or len(cleaned) > 16 or any(c not in '0123456789abcdef' for c in cleaned):
+        raise SystemExit(f'Invalid GW_LINK_ID "{text}": expected 1-16 hex digits (optional 0x prefix).')
+    value = int(cleaned, 16)
+    if value == 0:
+        raise SystemExit('Invalid GW_LINK_ID: must be non-zero.')
+    return value
+
+if command == 'flash':
+    if not raw:
+        if not sys.stdin.isatty():
+            raise SystemExit('GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=0x... bash deploy.sh flash).')
+        raw = input('Enter shared 64-bit hex link ID (or press Enter to generate one): ').strip()
+        if not raw:
+            value = secrets.randbits(64) or 1
+            print(f'Generated GW_LINK_ID=0x{value:016x} (use this same ID on both boards).')
+        else:
+            value = parse_link_id(raw)
+    else:
+        value = parse_link_id(raw)
+    content = f'#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n'
+elif raw:
+    value = parse_link_id(raw)
+    content = f'#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n'
+elif target.is_file():
+    raise SystemExit(0)
+else:
+    print('Note: using build-check link ID only; flash will prompt for your shared link ID.')
+    content = '#pragma once\n#define GW_LINK_ID UINT64_C(0x0000000000000001) /* build-check only */\n'
+
+if not target.is_file() or target.read_text() != content:
+    target.write_text(content)
+PY
 
 boards=(sender receiver)
 if [[ "$board" != all ]]; then boards=("$board"); fi

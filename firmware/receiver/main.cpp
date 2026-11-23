@@ -1,170 +1,294 @@
 #include <initializer_list>
 #include <stdio.h>
 #include <inttypes.h>
-#include "control.h"
+#include "../gateway/receiver.h"
+#include "../gateway/radio.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/uart.h"
 #include "driver/rmt_tx.h"
 #include "driver/rmt_encoder.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-// ESP32-S3-Relay-6CH Pico header mapping, NOT Pico GP numbers.
-static constexpr int CS=14, BUSY=13, RESET=12, SCK=35, MOSI=36, MISO=37;
-static constexpr uint64_t IDLE_REFRESH_MS=3600000; // Refresh once/hour only with relay OFF.
-static uint64_t ms() { return static_cast<uint64_t>(esp_timer_get_time()/1000); }
-static void pause_ms(unsigned n) { vTaskDelay(pdMS_TO_TICKS(n)); }
-static void set(int p,int v) { gpio_set_level(static_cast<gpio_num_t>(p),v); }
-static void out(int p,int v) { set(p,v); gpio_set_direction(static_cast<gpio_num_t>(p),GPIO_MODE_OUTPUT); }
-static int get(int p) { return gpio_get_level(static_cast<gpio_num_t>(p)); }
-
+static constexpr int CS = 14, BUSY = 13, RESET = 12, SCK = 35, MOSI = 36, MISO = 37;
+static uint64_t ms() {
+    return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
+static void set(int p, int v) {
+    gpio_set_level(static_cast<gpio_num_t>(p), v);
+}
+static void out(int p, int v) {
+    set(p, v);
+    gpio_set_direction(static_cast<gpio_num_t>(p), GPIO_MODE_OUTPUT);
+}
 static rmt_channel_handle_t led_channel;
 static rmt_encoder_handle_t led_encoder;
-static bool indicated=false;
+static bool indicated = false;
 static void outputs(bool on) {
-    set(1,on);
-    if(on==indicated) return;
-    rmt_symbol_word_t symbols[25]={};
-    const uint32_t color=on?0x180000:0; // GRB: green
-    for(int i=0;i<24;i++) {
-        bool bit=color & (1u<<(23-i));
-        symbols[i].level0=1; symbols[i].duration0=bit?8:4;
-        symbols[i].level1=0; symbols[i].duration1=bit?4:8;
+    set(1, on);
+    if (on == indicated) {
+        return;
     }
-    symbols[24].duration0=500; symbols[24].duration1=500;
-    rmt_transmit_config_t cfg={};
-    esp_err_t err=rmt_transmit(led_channel,led_encoder,symbols,sizeof(symbols),&cfg);
-    if(err==ESP_OK) err=rmt_tx_wait_all_done(led_channel,50);
-    if(err!=ESP_OK) { set(1,0); esp_restart(); }
-    indicated=on;
-    printf("RELAY %d t=%" PRIu64 "\n",on,ms());
+    rmt_symbol_word_t symbols[25] = {};
+    const uint32_t color = on ? 0x180000 : 0; // GRB: green
+    for (int i = 0; i < 24; i++) {
+        bool bit = color & (1u << (23 - i));
+        symbols[i].level0 = 1;
+        symbols[i].duration0 = bit ? 8 : 4;
+        symbols[i].level1 = 0;
+        symbols[i].duration1 = bit ? 4 : 8;
+    }
+    symbols[24].duration0 = 500;
+    symbols[24].duration1 = 500;
+    rmt_transmit_config_t cfg = {};
+    esp_err_t err = rmt_transmit(led_channel, led_encoder, symbols, sizeof(symbols), &cfg);
+    if (err == ESP_OK) {
+        err = rmt_tx_wait_all_done(led_channel, 50);
+    }
+    if (err != ESP_OK) {
+        set(1, 0);
+        esp_restart();
+    }
+    indicated = on;
+    printf("RELAY %d t=%" PRIu64 "\n", on, ms());
 }
 static void led_init() {
-    rmt_tx_channel_config_t cfg={}; cfg.gpio_num=GPIO_NUM_38;
-    cfg.clk_src=RMT_CLK_SRC_DEFAULT; cfg.resolution_hz=10000000;
-    cfg.mem_block_symbols=64; cfg.trans_queue_depth=1;
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&cfg,&led_channel));
-    rmt_copy_encoder_config_t enc={};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&enc,&led_encoder));
+    rmt_tx_channel_config_t cfg = {};
+    cfg.gpio_num = GPIO_NUM_38;
+    cfg.clk_src = RMT_CLK_SRC_DEFAULT;
+    cfg.resolution_hz = 10000000;
+    cfg.mem_block_symbols = 64;
+    cfg.trans_queue_depth = 1;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&cfg, &led_channel));
+    rmt_copy_encoder_config_t enc = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&enc, &led_encoder));
     ESP_ERROR_CHECK(rmt_enable(led_channel));
-    indicated=true; outputs(false);
+    indicated = true;
+    outputs(false);
 }
 
 static spi_device_handle_t spi;
-static uint8_t txbuf[32],rxbuf[32];
-static bool command(const uint8_t *p,size_t n,size_t read=0) {
-    if(n>sizeof(txbuf) || read>sizeof(txbuf)-n) return false;
-    const uint64_t start=ms();
-    while(get(BUSY)) { if(ms()-start>=BUSY_TIMEOUT_US/1000) return false; pause_ms(1); }
-    memset(txbuf,0,n+read); memcpy(txbuf,p,n); memset(rxbuf,0,n+read);
-    spi_transaction_t t={}; t.length=(n+read)*8; t.tx_buffer=txbuf; t.rx_buffer=rxbuf;
-    set(CS,0); const esp_err_t e=spi_device_polling_transmit(spi,&t); set(CS,1);
-    return e==ESP_OK;
+extern "C" bool rf_transfer(const uint8_t *tx, uint8_t *rx, size_t n) {
+    // DMA-free ESP32 SPI transfers are limited by the hardware FIFO. Keep CS
+    // asserted across chunks so the SX1262 sees one command of up to 258 bytes.
+    bool ok = true;
+    set(CS, 0);
+    for (size_t offset = 0; offset < n && ok; offset += 32) {
+        size_t count = n - offset;
+        if (count > 32) {
+            count = 32;
+        }
+        spi_transaction_t t = {};
+        t.length = count * 8;
+        t.tx_buffer = tx + offset;
+        t.rx_buffer = rx + offset;
+        ok = spi_device_polling_transmit(spi, &t) == ESP_OK;
+    }
+    set(CS, 1);
+    return ok;
 }
-template<size_t N> static bool cmd(const uint8_t (&p)[N]) { return command(p,N); }
-static bool clear_irq() { const uint8_t p[]={2,0xff,0xff};return cmd(p); }
-static bool receive() { const uint8_t p[]={0x82,255,255,255}; return cmd(p); }
-static bool irq(uint16_t &value) {
-    uint8_t p=0x12; if(!command(&p,1,3)) return false;
-    value=(rxbuf[2]<<8)|rxbuf[3];return true;
+extern "C" bool rf_busy(void) {
+    return gpio_get_level(static_cast<gpio_num_t>(BUSY));
 }
-static bool radio_healthy() {
-    uint8_t p=0xc0;
-    if(!command(&p,1,1) || (rxbuf[1]&0x70)!=0x50) return false;
-    const unsigned status=(rxbuf[1]>>1)&7;
-    if(status==3 || status==4 || status==5) return false;
-    p=0x17;
-    return command(&p,1,3) && rxbuf[2]==0 && rxbuf[3]==0;
+extern "C" void rf_reset(bool high) {
+    set(RESET, high);
 }
-static bool radio_init() {
-    set(RESET,0);pause_ms(2);set(RESET,1);pause_ms(20);
-    const uint32_t f=static_cast<uint32_t>((static_cast<uint64_t>(RF_FREQUENCY_HZ)<<25)/32000000);
-    const uint32_t tcxo=TCXO_STARTUP_MS*64u;
-    const uint8_t init[][9]={
-        {0x80,0},{0x97,TCXO_VOLTAGE_CODE,static_cast<uint8_t>(tcxo>>16),static_cast<uint8_t>(tcxo>>8),static_cast<uint8_t>(tcxo)},
-        {0x9d,1},{7,0,0},{0x89,0x7f},{0x8a,1},{0x98,0xe1,0xe9},
-        {0x86,static_cast<uint8_t>(f>>24),static_cast<uint8_t>(f>>16),static_cast<uint8_t>(f>>8),static_cast<uint8_t>(f)},
-        {0x8b,LORA_SF,LORA_BW_CODE,LORA_CR_CODE,LORA_LDRO},
-        {0x8f,0,0},{0x8c,0,PREAMBLE_SYMBOLS,0,255,1,0},
-        {0x0d,0x08,0xac,0x96}, // Boosted RX gain.
-        {0x0d,0x07,0x40,static_cast<uint8_t>(SYNC_WORD>>8),static_cast<uint8_t>(SYNC_WORD)},
-        {8,2,0x62,2,0x62,0,0,0,0}
-    };
-    const size_t sizes[]={2,5,2,3,2,2,3,5,5,3,7,4,5,9};
-    for(size_t i=0;i<sizeof(sizes)/sizeof(sizes[0]);i++) if(!command(init[i],sizes[i])) return false;
-    return clear_irq() && receive() && radio_healthy();
+extern "C" uint64_t rf_time_us(void) {
+    return static_cast<uint64_t>(esp_timer_get_time());
 }
-
-// 0: no usable packet, 1: packet, -1: radio fault. CRC/header failures discarded.
-static int poll(uint8_t *packet,size_t &length) {
-    uint16_t flags;if(!irq(flags)) return -1;
-    if(!flags) return 0;
-    if(flags&0x200) return -1;
-    int result=0;
-    if((flags&2) && !(flags&0x60)) {
-        uint8_t p=0x13;if(!command(&p,1,3)) return -1;
-        length=rxbuf[2];uint8_t read[]={0x1e,rxbuf[3]};
-        if(length==ON_PACKET_SIZE) {
-            if(!command(read,2,length+1)) return -1;
-            memcpy(packet,rxbuf+3,length);result=1;
+extern "C" void rf_delay_us(unsigned us) {
+    if (us >= 1000) {
+        vTaskDelay(pdMS_TO_TICKS((us + 999) / 1000));
+    } else {
+        esp_rom_delay_us(us);
+    }
+}
+static gw_receiver receiver;
+static uint8_t serial_frame[GW_RESPONSE_MAX];
+static size_t serial_used;
+static bool serial_overflow;
+static uint64_t serial_deadline, serial_last_us;
+static void serial_begin(uint64_t now) {
+    uint8_t frame[GW_DATA_MAX + 2];
+    size_t n = receiver.request.length;
+    memcpy(frame, receiver.request.data, n);
+    uint16_t crc = gw_crc(frame, n);
+    frame[n++] = (uint8_t)crc;
+    frame[n++] = (uint8_t)(crc >> 8);
+    uart_flush_input(UART_NUM_1);
+    serial_used = 0;
+    serial_overflow = false;
+    serial_last_us = 0;
+    if (uart_write_bytes(UART_NUM_1, frame, n) != (int)n) {
+        serial_overflow = true;
+    }
+    serial_deadline = now + SERIAL_RESPONSE_MS * 1000;
+}
+static bool serial_poll(uint64_t now, gw_packet *reply) {
+    if (!receiver.serial_pending) {
+        return false;
+    }
+    uint8_t incoming[64];
+    int n = uart_read_bytes(UART_NUM_1, incoming, sizeof(incoming), 0);
+    if (n > 0) {
+        serial_last_us = now;
+        if (serial_used + (size_t)n > sizeof(serial_frame)) {
+            serial_overflow = true;
+        } else {
+            memcpy(serial_frame + serial_used, incoming, (size_t)n);
+            serial_used += (size_t)n;
         }
     }
-    if(!clear_irq()||!receive()) return -1;
-    return result;
+    if (now >= serial_deadline ||
+        (serial_last_us && now - serial_last_us >= SERIAL_GAP_MS * 1000)) {
+        gw_receiver_serial_done(&receiver, serial_frame, serial_overflow ? 0 : serial_used,
+                                serial_last_us ? serial_last_us : now, reply);
+        return true;
+    }
+    return false;
 }
-
-extern "C" void app_main() {
-    for(int p:{1,2,41,42,45,46}) out(p,0); // All relays OFF before peripheral initialization.
-    // Subscribe before any peripheral initialization can block while yielding.
-    esp_task_wdt_config_t wd={};wd.timeout_ms=WATCHDOG_MS;wd.idle_core_mask=3;wd.trigger_panic=true;
-    ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&wd));ESP_ERROR_CHECK(esp_task_wdt_add(nullptr));
+extern "C" void app_main(void) {
+    // Establish fail-off outputs before initializing peripherals.
+    for (int p : {1, 2, 41, 42, 45, 46}) {
+        out(p, 0);
+    }
+    esp_task_wdt_config_t wd = {};
+    wd.timeout_ms = WATCHDOG_MS;
+    wd.idle_core_mask = 3;
+    wd.trigger_panic = true;
+    ESP_ERROR_CHECK(esp_task_wdt_reconfigure(&wd));
+    ESP_ERROR_CHECK(esp_task_wdt_add(nullptr));
     led_init();
-    out(CS,1);out(RESET,0);gpio_set_direction(static_cast<gpio_num_t>(BUSY),GPIO_MODE_INPUT);
-    spi_bus_config_t bus={};bus.mosi_io_num=MOSI;bus.miso_io_num=MISO;
-    bus.sclk_io_num=SCK;bus.quadwp_io_num=-1;bus.quadhd_io_num=-1;bus.max_transfer_sz=32;
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST,&bus,SPI_DMA_DISABLED));
-    spi_device_interface_config_t dev={};dev.clock_speed_hz=SPI_BAUD_HZ;dev.spics_io_num=-1;dev.queue_size=1;
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST,&dev,&spi));
-    Control control;bool ready=false;unsigned failures=0;
-    uint64_t next_try=0,last_refresh=0,last_health=0,last_log=0,accepted=0,rejected=0;
-    printf("BOOT " FIRMWARE_VERSION " receiver ON-only SF=%u hold=%" PRIu64 " reset=%d\n",LORA_SF,RECEIVER_HOLD_MS,esp_reset_reason());
-    for(;;) {
-        uint64_t now=ms();control.tick(now);outputs(control.on);
-        if(!ready && now>=next_try) {
-            ready=radio_init();next_try=ms()+RADIO_RETRY_MS;
-            if(ready) {failures=0;last_refresh=ms();last_health=ms();printf("RADIO READY\n");}
-            else if(++failures>=MAX_INIT_FAILURES) esp_restart();
-        }
-        if(ready) {
-            uint8_t packet[ON_PACKET_SIZE];size_t n=0;const int result=poll(packet,n);
-            if(result<0) ready=false;
-            if(result==1) {
-                if(control.accept(packet,n,ms())) {
-                    ++accepted;outputs(control.on);
-                    printf("RX ON t=%" PRIu64 "\n",ms());
-                } else ++rejected; // Includes legacy OFF: cannot turn on or renew.
+    out(CS, 1);
+    out(RESET, 0);
+    gpio_set_direction(static_cast<gpio_num_t>(BUSY), GPIO_MODE_INPUT);
+    spi_bus_config_t bus = {};
+    bus.mosi_io_num = MOSI;
+    bus.miso_io_num = MISO;
+    bus.sclk_io_num = SCK;
+    bus.quadwp_io_num = -1;
+    bus.quadhd_io_num = -1;
+    bus.max_transfer_sz = 32;
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_DISABLED));
+    spi_device_interface_config_t dev = {};
+    dev.clock_speed_hz = SPI_BAUD_HZ;
+    dev.spics_io_num = -1;
+    dev.queue_size = 1;
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &spi));
+    uart_config_t serial = {};
+    serial.baud_rate = SERIAL_BAUD;
+    serial.data_bits = UART_DATA_8_BITS;
+    serial.parity = SERIAL_PARITY == 0   ? UART_PARITY_DISABLE
+                    : SERIAL_PARITY == 1 ? UART_PARITY_ODD
+                                         : UART_PARITY_EVEN;
+    serial.stop_bits = SERIAL_STOP_BITS == 2 ? UART_STOP_BITS_2 : UART_STOP_BITS_1;
+    serial.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    serial.source_clk = UART_SCLK_DEFAULT;
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 512, 0, 0, nullptr, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &serial));
+    // Board uses an inverter/isolator for automatic direction; no RTS GPIO.
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, 17, 18, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    uint64_t boot;
+    esp_fill_random(&boot, sizeof(boot));
+    gw_receiver_init(&receiver, boot | 1);
+    bool ready = false, transmitting = false, pending = false;
+    unsigned failures = 0;
+    uint64_t retry_ms = 0, refresh_ms = 0, health_ms = 0, log_ms = 0, tx_deadline = 0;
+    gw_packet request, reply;
+    uint8_t wire[GW_PACKET_MAX];
+    printf("BOOT " FIRMWARE_VERSION " gateway receiver hold=130s\n");
+    for (;;) {
+        uint64_t now = rf_time_us();
+        gw_receiver_tick(&receiver, now / 1000);
+        outputs(receiver.on);
+        if (!ready && now / 1000 >= retry_ms) {
+            ready = rf_init() && rf_receive();
+            retry_ms = ms() + RADIO_RETRY_MS;
+            if (ready) {
+                failures = 0;
+                refresh_ms = health_ms = ms();
+                printf("RADIO READY\n");
+            } else if (++failures >= MAX_INIT_FAILURES) {
+                esp_restart();
             }
-            now=ms();
-            if(now-last_health>=RADIO_HEALTH_MS) {
-                ready=ready&&radio_healthy();last_health=ms();
-            }
-            if(ready && !control.on && now-last_refresh>=IDLE_REFRESH_MS) {
-                ready=false;next_try=ms();printf("RADIO scheduled idle refresh\n");
+        }
+        if (ready && transmitting) {
+            int result = rf_tx_poll();
+            if (result == 1) {
+                transmitting = false;
+                ready = rf_receive();
+            } else if (result < 0 || now >= tx_deadline) {
+                ready = false;
             }
         }
-        if(!ready) {control.fail();outputs(false);set(RESET,0);}
-        control.tick(ms());outputs(control.on); // Recheck lease after bounded radio operations.
-        now=ms();
-        if(now-last_log>=HEALTH_LOG_MS) {
-            printf("HEALTH ready=%d on=%d accepted=%" PRIu64 " rejected=%" PRIu64
-                   " free=%u min=%u stack=%u\n",ready,control.on,accepted,rejected,
-                   static_cast<unsigned>(esp_get_free_heap_size()),static_cast<unsigned>(esp_get_minimum_free_heap_size()),
-                   static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-            last_log=now;
+        if (ready && !transmitting) {
+            if (serial_poll(now, &reply)) {
+                pending = true;
+            }
+            if (!pending && !receiver.serial_pending) {
+                size_t n = 0;
+                int result = rf_rx_poll(wire, &n);
+                if (result == 1 && gw_decode(&request, wire, n)) {
+                    int action = gw_receiver_request(&receiver, &request, rf_time_us(), &reply);
+                    if (action == 1) {
+                        pending = true;
+                    } else if (action == 2) {
+                        serial_begin(rf_time_us());
+                    }
+                } else if (result < 0 && result != -2) {
+                    ready = false;
+                }
+            }
+            if (pending) {
+                pending = false;
+                if (rf_time_us() <= receiver.reply_deadline_us) {
+                    if (reply.kind == GW_SYNC) {
+                        gw_put64(reply.data + 8,
+                                 rf_time_us() + rf_airtime_us(GW_HEADER_SIZE + reply.length));
+                    }
+                    size_t n = gw_encode(&reply, wire);
+                    ready = n && rf_transmit_before(wire, n, receiver.reply_deadline_us);
+                    transmitting = ready;
+                    tx_deadline = rf_time_us() + TX_WAIT_MS * 1000;
+                }
+            }
+            if (ready && !transmitting && !receiver.serial_pending &&
+                ms() - health_ms >= RADIO_HEALTH_MS) {
+                ready = rf_health(true);
+                health_ms = ms();
+            }
+            if (ready && !transmitting && !receiver.serial_pending && !receiver.on &&
+                ms() - refresh_ms >= SENDER_RADIO_REFRESH_MS) {
+                ready = rf_init() && rf_receive();
+                refresh_ms = health_ms = ms();
+            }
         }
-        ESP_ERROR_CHECK(esp_task_wdt_reset());pause_ms(10);
+        if (!ready) {
+            // Drive the relay off before radio recovery or serial cleanup.
+            gw_receiver_fail(&receiver);
+            outputs(false);
+            rf_abort();
+            transmitting = false;
+            pending = false;
+            if (receiver.serial_pending) {
+                gw_receiver_serial_done(&receiver, serial_frame, 0, now, &reply);
+            }
+        }
+        // Recheck with fresh time after peripheral calls, not the loop's old timestamp.
+        gw_receiver_tick(&receiver, ms());
+        outputs(receiver.on);
+        if (ms() >= log_ms) {
+            printf("HEALTH ready=%d on=%d serial=%d synced=%d free=%u\n", ready, receiver.on,
+                   receiver.serial_pending, receiver.clock.valid,
+                   (unsigned)esp_get_free_heap_size());
+            log_ms = ms() + HEALTH_LOG_MS;
+        }
+        ESP_ERROR_CHECK(esp_task_wdt_reset());
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }

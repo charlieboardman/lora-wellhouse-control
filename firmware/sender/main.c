@@ -2,92 +2,201 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
+#include "pico/rand.h"
 #include "hardware/watchdog.h"
-#include "../config.h"
-#include "radio.h"
-#include "sender_logic.h"
+#include "hardware/spi.h"
+#include "hardware/sync.h"
+#include "../gateway/radio.h"
+#include "../gateway/sender.h"
+#include "network.h"
 
-static uint64_t ms(void) { return time_us_64() / 1000u; }
-static bool led_available, led_state;
-static void led_set(bool on) {
-    if (led_available && on != led_state) {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, on);
-        led_state = on;
-    }
+static volatile uint64_t event_us;
+static uint64_t take_event_us(void) {
+    uint32_t flags = save_and_disable_interrupts();
+    uint64_t event = event_us;
+    event_us = 0;
+    restore_interrupts(flags);
+    return event ? event : time_us_64();
 }
-
+static void radio_irq(unsigned gpio, uint32_t events) {
+    (void)gpio;
+    (void)events;
+    event_us = time_us_64();
+}
+bool rf_transfer(const uint8_t *tx, uint8_t *rx, size_t n) {
+    gpio_put(RADIO_CS, 0);
+    int count = spi_write_read_blocking(spi1, tx, rx, n);
+    gpio_put(RADIO_CS, 1);
+    return count == (int)n;
+}
+bool rf_busy(void) {
+    return gpio_get(RADIO_BUSY);
+}
+void rf_reset(bool high) {
+    gpio_put(RADIO_RESET, high);
+}
+void rf_delay_us(unsigned us) {
+    sleep_us(us);
+}
+uint64_t rf_time_us(void) {
+    return time_us_64();
+}
+static void radio_pins(void) {
+    gpio_init(RADIO_CS);
+    gpio_put(RADIO_CS, 1);
+    gpio_set_dir(RADIO_CS, GPIO_OUT);
+    gpio_init(RADIO_RESET);
+    gpio_put(RADIO_RESET, 0);
+    gpio_set_dir(RADIO_RESET, GPIO_OUT);
+    gpio_init(RADIO_BUSY);
+    gpio_set_dir(RADIO_BUSY, GPIO_IN);
+    gpio_init(RADIO_DIO1);
+    gpio_set_dir(RADIO_DIO1, GPIO_IN);
+    spi_init(spi1, SPI_BAUD_HZ);
+    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    gpio_set_function(RADIO_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(RADIO_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(RADIO_MISO, GPIO_FUNC_SPI);
+    gpio_set_irq_enabled_with_callback(RADIO_DIO1, GPIO_IRQ_EDGE_RISE, true, radio_irq);
+}
+static gw_sender sender;
 int main(void) {
     gpio_init(FLOAT_GPIO);
     gpio_set_dir(FLOAT_GPIO, GPIO_IN);
-    gpio_pull_up(FLOAT_GPIO); // Open/disconnected switch -> no ON commands.
-    radio_gpio_init();        // Hold radio reset low until configured.
-    watchdog_enable(WATCHDOG_MS, false); // Also runs if CPU/debugger stops.
-    stdio_init_all();         // USB logging optional; never wait for a host.
-    led_available = cyw43_arch_init() == 0; // LED access only; Wi-Fi/BT never enabled.
-    if (led_available) cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
-    sender_schedule_t schedule;
-    sender_schedule_init(&schedule, ms());
-    bool ready = false, refresh_requested = false;
-    unsigned init_failures = 0;
-    uint64_t next_try = 0, last_health = 0, last_refresh = 0, last_log = 0, sent = 0, silent = 0;
-    printf("BOOT " FIRMWARE_VERSION " pico2_w ON-only GP%u interval=%" PRIu64 " hold=%" PRIu64
-           " SF%u TX=%d dBm watchdog_reset=%d\n", FLOAT_GPIO,
-           SAMPLE_INTERVAL_MS, RECEIVER_HOLD_MS, LORA_SF, TX_POWER_DBM, watchdog_caused_reboot());
+    gpio_pull_up(FLOAT_GPIO);
+    radio_pins();
+    watchdog_enable(WATCHDOG_MS, false);
+    stdio_init_all();
+    bool net_ready = network_init();
+    gw_sender_init(&sender, get_rand_64() | 1, time_us_64() / 1000);
+    enum { IDLE, TX, RX } phase = IDLE;
+    bool ready = false, led = false;
+    unsigned failures = 0;
+    uint64_t retry_ms = 0, refresh_ms = 0, health_ms = 0, sample_ms = 0, log_ms = 0, deadline = 0,
+             quiet_until = 0, exchange_start = 0;
+    uint8_t wire[GW_PACKET_MAX];
+    gw_packet packet;
+    printf("BOOT " FIRMWARE_VERSION " gateway sender ON=30s hold=130s network=%d\n", net_ready);
     for (;;) {
-        uint64_t now = ms();
-        if (refresh_requested || (!ready && now >= next_try)) {
-            refresh_requested = false;
-            ready = radio_init();
-            next_try = ms() + RADIO_RETRY_MS;
-            last_health = ms();
+        uint64_t us = time_us_64(), now = us / 1000;
+        if (net_ready) {
+            network_poll(&sender, us);
+        }
+        if (now >= sample_ms) {
+            gw_sender_sample(&sender, !gpio_get(FLOAT_GPIO), now);
+            sample_ms = now + SAMPLE_INTERVAL_MS;
+            if (!sender.grounded || now < sender.pause_until_ms) {
+                led = false;
+            }
+        }
+        if (!ready && now >= retry_ms) {
+            ready = rf_init();
+            retry_ms = time_us_64() / 1000 + RADIO_RETRY_MS;
             if (ready) {
-                init_failures = 0;
-                last_refresh = last_health;
-                printf("RADIO READY t=%" PRIu64 "\n", ms());
-            } else {
-                printf("RADIO init failed %u\n", ++init_failures);
-                if (init_failures >= MAX_INIT_FAILURES) {
-                    radio_abort(); led_set(false);
-                    watchdog_reboot(0, 0, 10);
-                    for (;;) tight_loop_contents();
+                failures = 0;
+                refresh_ms = health_ms = time_us_64() / 1000;
+                printf("RADIO READY\n");
+            } else if (++failures >= MAX_INIT_FAILURES) {
+                watchdog_reboot(0, 0, 10);
+                for (;;) {
+                    tight_loop_contents();
                 }
             }
         }
-        now = ms();
-        if (ready && now - last_health >= RADIO_HEALTH_MS) {
-            ready = radio_healthy();
-            last_health = ms();
-            if (!ready) next_try = ms() + RADIO_RETRY_MS;
-        }
-        now = ms();
-        if (sender_take_slot(&schedule, now)) {
-            // Exactly one sample per slot. No input-edge transmissions or debounce.
-            const bool grounded = !gpio_get(FLOAT_GPIO);
-            if (sender_should_transmit(grounded, ready)) {
-                ready = radio_send_on();
-                led_set(ready);
-                if (ready) ++sent;
-                else next_try = ms() + RADIO_RETRY_MS;
-                printf("TX ON ok=%d sampled=%" PRIu64 " done=%" PRIu64 "\n", ready, now, ms());
-            } else {
-                led_set(false); ++silent;
-                printf("SILENT grounded=%d ready=%d t=%" PRIu64 "\n", grounded, ready, now);
+        bool fault = false;
+        if (ready && phase == TX) {
+            int result = rf_tx_poll();
+            if (result == 1) {
+                uint64_t done = take_event_us();
+                gw_sender_sent(&sender, done);
+                if (sender.out.kind == GW_ON) {
+                    led = true;
+                }
+                event_us = 0;
+                if (rf_receive()) {
+                    phase = RX;
+                    deadline = done / 1000 + REPLY_WINDOW_MS;
+                } else {
+                    fault = true;
+                }
+            } else if (result < 0 || now >= deadline) {
+                fault = true;
             }
-            // TX is synchronous and finished here. Reconfigure on the next loop,
-            // after feeding the watchdog, without changing the sample schedule.
-            if (ready && ms() - last_refresh >= SENDER_RADIO_REFRESH_MS) {
-                refresh_requested = true;
-                printf("RADIO scheduled refresh t=%" PRIu64 "\n", ms());
+        } else if (ready && phase == RX) {
+            size_t n = 0;
+            int result = rf_rx_poll(wire, &n);
+            if (result == 1) {
+                uint64_t done = take_event_us();
+                if (gw_decode(&packet, wire, n) && gw_sender_reply(&sender, &packet, done)) {
+                    if (!rf_idle()) {
+                        fault = true;
+                    }
+                    phase = IDLE;
+                    quiet_until = time_us_64() / 1000 + RADIO_GUARD_MS;
+                }
+            } else if (result < 0 && result != -2) {
+                fault = true;
+            }
+            if (phase == RX && now >= deadline) {
+                gw_sender_timeout(&sender, now);
+                if (!rf_idle()) {
+                    fault = true;
+                }
+                phase = IDLE;
+                quiet_until = now + RADIO_GUARD_MS;
             }
         }
-        if (!ready) { radio_abort(); led_set(false); }
-        now = ms();
-        if (now - last_log >= HEALTH_LOG_MS) {
-            printf("HEALTH version=" FIRMWARE_VERSION " tx_dbm=%d ready=%d sent=%" PRIu64 " silent=%" PRIu64 " t=%" PRIu64 "\n",
-                   TX_POWER_DBM, ready, sent, silent, now);
-            last_log = now;
+        if (fault) {
+            // A local radio failure does not prove the peer stopped transmitting.
+            // Reserve the entire exchange window before scheduling another one.
+            gw_sender_timeout(&sender, now);
+            rf_abort();
+            ready = false;
+            led = false;
+            phase = IDLE;
+            quiet_until = exchange_start + TX_WAIT_MS + REPLY_WINDOW_MS + RADIO_GUARD_MS;
+            retry_ms = now + RADIO_RETRY_MS;
         }
-        watchdog_update(); // Feed only after a complete successful loop iteration.
-        sleep_ms(5);
+        if (ready && phase == IDLE && now >= quiet_until) {
+            if (now - health_ms >= RADIO_HEALTH_MS) {
+                ready = rf_health(false);
+                health_ms = now;
+            }
+            if (ready && now - refresh_ms >= SENDER_RADIO_REFRESH_MS) {
+                ready = rf_init();
+                refresh_ms = now;
+                health_ms = now;
+            }
+            if (ready && gw_sender_next(&sender, now, &packet)) {
+                size_t n = gw_encode(&packet, wire);
+                event_us = 0;
+                exchange_start = now;
+                if (n && rf_transmit(wire, n)) {
+                    phase = TX;
+                    deadline = now + TX_WAIT_MS;
+                } else {
+                    gw_sender_timeout(&sender, now);
+                    ready = false;
+                    quiet_until = now + TX_WAIT_MS + REPLY_WINDOW_MS;
+                }
+            }
+            if (!ready) {
+                rf_abort();
+                led = false;
+                retry_ms = now + RADIO_RETRY_MS;
+            }
+        }
+        if (net_ready) {
+            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led);
+        }
+        if (now >= log_ms) {
+            printf("HEALTH ready=%d float=%d phase=%d queued=%u peer=%" PRIu64
+                   " synced=%d t=%" PRIu64 "\n",
+                   ready, sender.grounded, phase, sender.count, sender.peer, sender.clock.valid,
+                   now);
+            log_ms = now + HEALTH_LOG_MS;
+        }
+        watchdog_update();
+        sleep_ms(2);
     }
 }

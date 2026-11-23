@@ -1,18 +1,12 @@
 #include "radio.h"
 #include "../config.h"
-#include <stddef.h>
 #include <string.h>
-#include "pico/stdlib.h"
-#include "hardware/spi.h"
-
-static uint8_t tx[32], rx[32];
-static const uint8_t on_packet[ON_PACKET_SIZE] = {ON_PACKET_BYTES};
-
+static uint8_t tx[260],rx[260];
 static bool wait_ready(void) {
-    const uint64_t start = time_us_64();
-    while (gpio_get(RADIO_BUSY)) {
-        if (time_us_64() - start >= BUSY_TIMEOUT_US) return false;
-        sleep_us(50);
+    const uint64_t start = rf_time_us();
+    while (rf_busy()) {
+        if (rf_time_us() - start >= BUSY_TIMEOUT_US) return false;
+        rf_delay_us(50);
     }
     return true;
 }
@@ -23,10 +17,7 @@ static bool command(const uint8_t *p, size_t n, size_t extra) {
     memset(tx, 0, n + extra);
     memcpy(tx, p, n);
     memset(rx, 0, n + extra);
-    gpio_put(RADIO_CS, 0);
-    const int count = spi_write_read_blocking(spi1, tx, rx, n + extra);
-    gpio_put(RADIO_CS, 1);
-    return count == (int)(n + extra) && wait_ready();
+    return rf_transfer(tx, rx, n + extra) && wait_ready();
 }
 #define CMD(...) command((const uint8_t[]){__VA_ARGS__}, sizeof((const uint8_t[]){__VA_ARGS__}), 0)
 
@@ -47,28 +38,12 @@ static bool irq_read(uint16_t *flags) {
     return true;
 }
 
-void radio_gpio_init(void) {
-    gpio_init(RADIO_CS); gpio_put(RADIO_CS, 1); gpio_set_dir(RADIO_CS, GPIO_OUT);
-    gpio_init(RADIO_RESET); gpio_put(RADIO_RESET, 0); gpio_set_dir(RADIO_RESET, GPIO_OUT);
-    gpio_init(RADIO_BUSY); gpio_set_dir(RADIO_BUSY, GPIO_IN);
-    gpio_init(RADIO_DIO1); gpio_set_dir(RADIO_DIO1, GPIO_IN);
-    spi_init(spi1, SPI_BAUD_HZ);
-    spi_set_format(spi1, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    gpio_set_function(RADIO_SCK, GPIO_FUNC_SPI);
-    gpio_set_function(RADIO_MOSI, GPIO_FUNC_SPI);
-    gpio_set_function(RADIO_MISO, GPIO_FUNC_SPI);
-}
-
-void radio_abort(void) {
-    gpio_put(RADIO_CS, 1);
-    gpio_put(RADIO_RESET, 0); // Stop RF activity even if the command path failed.
-}
-
-bool radio_healthy(void) {
+void rf_abort(void) { rf_reset(false); }
+bool rf_health(bool receiving) {
     const uint8_t status = 0xc0, errors = 0x17;
     if (!command(&status, 1, 1)) return false;
     const uint8_t s = rx[1], result = (s >> 1) & 7u;
-    if ((s & 0x70u) != 0x20u || result == 3 || result == 4 || result == 5) return false;
+    if ((s & 0x70u) != (receiving ? 0x50u : 0x20u) || result == 3 || result == 4 || result == 5) return false;
     if (!command(&errors, 1, 3)) return false;
     if (rx[2] != 0 || rx[3] != 0) return false;
     // Status alone does not prove configuration is intact. Check the readable
@@ -78,9 +53,9 @@ bool radio_healthy(void) {
         sync_hi == (uint8_t)(SYNC_WORD >> 8) && sync_lo == (uint8_t)SYNC_WORD;
 }
 
-bool radio_init(void) {
-    radio_abort(); sleep_ms(2);
-    gpio_put(RADIO_RESET, 1); sleep_ms(20);
+bool rf_init(void) {
+    rf_abort(); rf_delay_us(2000);
+    rf_reset(true); rf_delay_us(20000);
     const uint32_t frf = (uint32_t)(((uint64_t)RF_FREQUENCY_HZ << 25) / 32000000u);
     const uint32_t tcxo_ticks = TCXO_STARTUP_MS * 64u;
     bool ok = CMD(0x80, 0) && // STDBY_RC
@@ -93,37 +68,56 @@ bool radio_init(void) {
         CMD(0x86, (uint8_t)(frf >> 24), (uint8_t)(frf >> 16), (uint8_t)(frf >> 8), (uint8_t)frf) &&
         CMD(0x8b, LORA_SF, LORA_BW_CODE, LORA_CR_CODE, LORA_LDRO) &&
         CMD(0x8f, 0, 0) &&
-        CMD(0x8c, 0, PREAMBLE_SYMBOLS, 0, ON_PACKET_SIZE, 1, 0) && // Explicit header, CRC, normal IQ
+        CMD(0x8c, 0, PREAMBLE_SYMBOLS, 0, 255, 1, 0) && // Explicit header, CRC, normal IQ
         CMD(0x95, 4, 7, 0, 1) && // SX1262 PA configuration
         CMD(0x8e, (uint8_t)TX_POWER_DBM, 4) && // 200 us ramp
         CMD(0x93, 0x20) &&    // Fall back to STDBY_RC after TX.
-        CMD(0x08, 0x02, 0x01, 0x02, 0x01, 0, 0, 0, 0) && // TX_DONE / TIMEOUT
+        CMD(0x08, 0x02, 0x63, 0x02, 0x63, 0, 0, 0, 0) && // TX_DONE / TIMEOUT
         CMD(0x0d, 0x07, 0x40, (uint8_t)(SYNC_WORD >> 8), (uint8_t)SYNC_WORD);
     uint8_t clamp = 0, modulation = 0;
-    // Semtech SX1262 PA clamp and non-500 kHz modulation-quality workarounds.
+    // Semtech SX1262 PA clamp and 500 kHz LoRa modulation-quality workarounds.
     ok = ok && reg_read(0x08d8, &clamp) && reg_write(0x08d8, clamp | 0x1e) &&
-        reg_read(0x0889, &modulation) && reg_write(0x0889, modulation | 0x04) &&
-        clear_irq() && radio_healthy();
-    if (!ok) radio_abort();
+        reg_read(0x0889, &modulation) && reg_write(0x0889, (uint8_t)(modulation & ~0x04u)) &&
+        reg_write(0x08ac,0x96) && clear_irq() && rf_health(false);
+    if (!ok) rf_abort();
     return ok;
 }
 
-bool radio_send_on(void) {
-    uint8_t buffer[2 + ON_PACKET_SIZE] = {0x0e, 0};
-    memcpy(buffer + 2, on_packet, sizeof(on_packet));
-    const uint32_t ticks = TX_TIMEOUT_MS * 64u;
-    bool ok = CMD(0x80, 0) && clear_irq() && command(buffer, sizeof(buffer), 0) &&
-        CMD(0x83, (uint8_t)(ticks >> 16), (uint8_t)(ticks >> 8), (uint8_t)ticks);
-    bool done = false;
-    const uint64_t start = time_us_64();
-    while (ok && time_us_64() - start < TX_WAIT_MS * 1000u) {
-        uint16_t flags = 0;
-        ok = irq_read(&flags);
-        if (!ok || (flags & 0x0200u)) { ok = false; break; }
-        if (flags & 1u) { done = true; break; }
-        sleep_ms(2);
-    }
-    ok = ok && done && CMD(0x80, 0) && clear_irq() && radio_healthy();
-    if (!ok) radio_abort();
-    return ok;
+
+uint64_t rf_airtime_us(size_t bytes) {
+    /* SF12/BW500/CR4/8/LDRO=0/explicit header/CRC/preamble8. */
+    unsigned groups=(unsigned)((8*bytes+43)/48);
+    return (UINT64_C(81)+32*groups)*2048;
 }
+bool rf_idle(void) { return CMD(0x80,0) && clear_irq(); }
+bool rf_receive(void) {
+    return CMD(0x80,0) && clear_irq() && CMD(0x8c,0,PREAMBLE_SYMBOLS,0,255,1,0) && CMD(0x82,255,255,255);
+}
+bool rf_transmit_before(const uint8_t *p,size_t n,uint64_t start_deadline_us) {
+    if(!n || n>255)return false;
+    uint8_t buffer[257]={0x0e,0};memcpy(buffer+2,p,n);
+    const uint32_t ticks=TX_TIMEOUT_MS*64u;
+    return CMD(0x80,0) && clear_irq() &&
+        CMD(0x8c,0,PREAMBLE_SYMBOLS,0,(uint8_t)n,1,0) &&
+        command(buffer,n+2,0) && wait_ready() && rf_time_us()<start_deadline_us && CMD(0x83,(uint8_t)(ticks>>16),(uint8_t)(ticks>>8),(uint8_t)ticks);
+}
+int rf_tx_poll(void) {
+    uint16_t flags=0;if(!irq_read(&flags))return -1;
+    if(flags&0x200)return -1;
+    if(!(flags&1))return 0;
+    return CMD(0x80,0) && clear_irq() ? 1:-1;
+}
+int rf_rx_poll(uint8_t *p,size_t *n) {
+    uint16_t flags=0;if(!irq_read(&flags))return -1;
+    if(!flags)return 0;
+    if(flags&0x200)return -1;
+    if(!(flags&2) || (flags&0x60))return clear_irq() ? -2:-1;
+    const uint8_t op=0x13;
+    if(!command(&op,1,3))return -1;
+    *n=rx[2];const uint8_t read[]={0x1e,rx[3]};
+    if(!command(read,2,*n+1))return -1;
+    memcpy(p,rx+3,*n);
+    return clear_irq() ? 1:-1;
+}
+
+bool rf_transmit(const uint8_t *p,size_t n) {return rf_transmit_before(p,n,UINT64_MAX);}

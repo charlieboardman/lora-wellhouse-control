@@ -3,3 +3,5 @@
 /.venv/
 /.backups/
 __pycache__/
+/firmware/wifi.local.h
+/upload.local.json

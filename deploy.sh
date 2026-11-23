@@ -3,13 +3,40 @@
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$root"
-command_name="${1:-build}"
-board="${2:-all}"
+if (( $# == 0 )) && [[ -t 0 ]]; then
+    while true; do
+        echo 'LoRa wellhouse controller'
+        echo '  1) Flash sender (Pico 2 W)'
+        echo '  2) Flash receiver (ESP32-S3)'
+        echo '  3) Flash both boards'
+        echo '  4) Test and build both boards (no flashing)'
+        echo '  5) Run host tests only'
+        echo '  6) Exit'
+        printf 'Select [1-6]: '
+        if ! read -r choice; then
+            echo
+            exit 0
+        fi
+        case "$choice" in
+            1) command_name=flash; board=sender; break ;;
+            2) command_name=flash; board=receiver; break ;;
+            3) command_name=flash; board=all; break ;;
+            4) command_name=build; board=all; break ;;
+            5) command_name=test; board=all; break ;;
+            6|q|Q|'') exit 0 ;;
+            *) echo "Invalid selection: $choice" ;;
+        esac
+    done
+else
+    command_name="${1:-build}"
+    board="${2:-all}"
+fi
 case "$command_name" in
   build|flash|test) ;;
   help|--help|-h)
     echo 'Usage: bash deploy.sh [build|flash|test] [sender|receiver|all]'
-    echo 'Default: set up, test, and build both boards. Flash also builds first.'
+    echo 'With no arguments in a terminal, opens an interactive menu.'
+    echo 'Non-interactive default: set up, test, and build both boards.'
     exit 0 ;;
   *) echo "Unknown command: $command_name" >&2; exit 2 ;;
 esac

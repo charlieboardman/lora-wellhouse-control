@@ -142,14 +142,17 @@ From the repository root, run:
 
   bash deploy.sh
 
-This creates the local Python environment, installs pinned tools, runs host
-checks, and builds both boards. It does not flash anything. The script is invoked
-with bash; no executable permission or manual virtual-environment activation is
-needed. Subsequent runs reuse the environment and unchanged firmware images.
+In an interactive terminal, this opens a menu to flash the sender, flash the
+receiver, flash both, test and build without flashing, or run host tests only.
+It creates the local Python environment, installs pinned tools, and runs host
+checks automatically. The script is invoked with bash; no executable permission
+or manual virtual-environment activation is needed. Subsequent runs reuse the
+environment and unchanged firmware images.
 
-Available commands:
+Direct CLI commands (skipping the menu):
 
-  bash deploy.sh                 Set up, test, build both boards
+  bash deploy.sh                 Interactive menu (or build all if non-interactive)
+  bash deploy.sh build           Set up, test, build both boards
   bash deploy.sh build sender    Set up, test, build the Pico only
   bash deploy.sh build receiver  Set up, test, build the ESP32 only
   bash deploy.sh test            Run host checks without building board firmware

@@ -381,33 +381,32 @@ forward/stop control. Confirm the VFD setup before connecting an actual load.
 Flashing is an explicit operation. Isolate the pump RUN circuit for initial
 checkout; do not flash or exercise relays with an operating pump connected.
 
-Before flashing, copy upload.example.json to upload.local.json (Git ignores it)
-and fill in your Pico mount path, ESP32 serial port, and receiver MAC address
-(or pass SENDER_UPLOAD_PORT, RECEIVER_UPLOAD_PORT, and RECEIVER_MAC in the
-environment).
+By default, flashing auto-detects a single connected RP2350 BOOTSEL drive or
+Espressif ESP32-S3 USB device. If you have multiple boards attached, want to pin
+a specific receiver MAC without an interactive prompt, or run non-interactively,
+copy upload.example.json to upload.local.json (Git ignores it) or pass
+SENDER_UPLOAD_PORT, RECEIVER_UPLOAD_PORT, and RECEIVER_MAC in the environment.
 
 Pico:
 
   1. Hold BOOTSEL while connecting USB to expose the RP2350 drive.
-  2. Set sender_port in upload.local.json (or SENDER_UPLOAD_PORT) to its mount
-     path, e.g. /run/media/YOUR_USER/RP2350.
-  3. Run bash deploy.sh flash sender.
+  2. Run bash deploy.sh flash sender.
 
-The uploader checks INFO_UF2.TXT for RP2350 family identity, copies the UF2 and
-flushes the write. This is not a check of the exact board model or an end-to-end
-firmware acceptance test.
+The uploader auto-detects the mounted RP2350 drive (or uses sender_port from
+upload.local.json / SENDER_UPLOAD_PORT), verifies INFO_UF2.TXT for RP2350 family
+identity, copies the UF2 and flushes the write. This is not a check of the exact
+board model or an end-to-end firmware acceptance test.
 
 Receiver:
 
   1. Connect the board's USB interface and ensure serial-device access.
-  2. Set receiver_port and receiver_mac in upload.local.json (or
-     RECEIVER_UPLOAD_PORT and RECEIVER_MAC) to your board's serial path and MAC.
-  3. Run bash deploy.sh flash receiver.
+  2. Run bash deploy.sh flash receiver.
 
-The uploader refuses to flash unless receiver_mac is configured and matches the
-connected ESP32. For replacement hardware, review and update both receiver_port
-and receiver_mac in upload.local.json. Do not remove the identity check just to
-get past an unexpected device error.
+The uploader auto-detects a single Espressif USB-Serial/JTAG port (or uses
+receiver_port from upload.local.json / RECEIVER_UPLOAD_PORT) and reads the
+board's MAC via esptool. If receiver_mac is configured, it refuses to flash any
+other board; otherwise it prints the detected port/MAC and asks for confirmation
+before backing up and flashing. Non-interactive flashing requires receiver_mac.
 
 Before its first write, the uploader reads the complete 16 MiB receiver flash
 into .backups/receiver-before.bin. It records identity and a SHA-256 checksum,

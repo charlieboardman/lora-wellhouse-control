@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 
+ESPRESSIF_VID = 0x303A
+
 
 def load_local_config(root):
     path = Path(root) / 'upload.local.json'
@@ -24,11 +26,73 @@ def resolve_setting(root, env_key, json_key, cli_value=''):
     return str(load_local_config(root).get(json_key, '')).strip()
 
 
-def upload_sender(build, port):
-    if not port:
+def _fat_mount_points():
+    mounts = []
+    proc_mounts = Path('/proc/mounts')
+    if not proc_mounts.is_file():
+        return mounts
+    for line in proc_mounts.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] in ('vfat', 'msdos'):
+            mount_path = parts[1].replace('\\040', ' ')
+            mounts.append(Path(mount_path))
+    return mounts
+
+
+def detect_sender_port(mounts=None):
+    candidates = _fat_mount_points() if mounts is None else [Path(m) for m in mounts]
+    matches = []
+    for mount in candidates:
+        info = mount / 'INFO_UF2.TXT'
+        try:
+            if info.is_file() and 'Board-ID: RP2350' in info.read_text():
+                matches.append(str(mount))
+        except OSError:
+            continue
+    if len(matches) == 1:
+        print('Auto-detected RP2350 sender at', matches[0])
+        return matches[0]
+    if not matches:
         raise RuntimeError(
-            'Sender upload port is not configured; set SENDER_UPLOAD_PORT or upload.local.json'
+            'No RP2350 BOOTSEL drive found; hold BOOTSEL while connecting the Pico 2 W, '
+            'or set SENDER_UPLOAD_PORT / upload.local.json'
         )
+    raise RuntimeError(
+        'Multiple RP2350 BOOTSEL drives found (' + ', '.join(matches) +
+        '); unplug extras or set SENDER_UPLOAD_PORT / upload.local.json'
+    )
+
+
+def detect_receiver_port(by_id_dir=Path('/dev/serial/by-id')):
+    matches = []
+    if by_id_dir.is_dir():
+        for entry in sorted(by_id_dir.iterdir()):
+            if 'espressif' in entry.name.lower():
+                matches.append(str(entry))
+    if not matches:
+        try:
+            from serial.tools import list_ports
+            for info in sorted(list_ports.comports(), key=lambda p: p.device):
+                if info.vid == ESPRESSIF_VID:
+                    matches.append(info.device)
+        except ImportError:
+            pass
+    if len(matches) == 1:
+        print('Auto-detected Espressif receiver at', matches[0])
+        return matches[0]
+    if not matches:
+        raise RuntimeError(
+            'No Espressif ESP32-S3 USB device found; connect the receiver '
+            'or set RECEIVER_UPLOAD_PORT / upload.local.json'
+        )
+    raise RuntimeError(
+        'Multiple Espressif USB devices found (' + ', '.join(matches) +
+        '); unplug extras or set RECEIVER_UPLOAD_PORT / upload.local.json'
+    )
+
+
+def upload_sender(build, port=''):
+    port = port.strip() if port else detect_sender_port()
     mount = Path(port)
     if 'Board-ID: RP2350' not in (mount / 'INFO_UF2.TXT').read_text():
         raise RuntimeError('Not an RP2350 BOOTSEL drive; refusing to flash')
@@ -40,20 +104,7 @@ def upload_sender(build, port):
         os.fsync(dst.fileno())
 
 
-def upload_receiver(root, build, port, expected_mac=None):
-    if not port:
-        raise RuntimeError(
-            'Receiver upload port is not configured; set RECEIVER_UPLOAD_PORT or upload.local.json'
-        )
-    mac = (
-        expected_mac.strip().lower()
-        if expected_mac is not None
-        else resolve_setting(root, 'RECEIVER_MAC', 'receiver_mac').lower()
-    )
-    if not mac or mac == 'xx:xx:xx:xx:xx:xx':
-        raise RuntimeError(
-            'RECEIVER_MAC is not configured; set RECEIVER_MAC or upload.local.json'
-        )
+def upload_receiver(root, build, port='', expected_mac=None):
     files = {'0x0': 'bootloader.bin', '0x8000': 'partitions.bin', '0x10000': 'firmware.bin'}
     flash = json.loads((build / 'flasher_args.json').read_text())
     if set(flash['flash_files']) != set(files):
@@ -61,12 +112,31 @@ def upload_receiver(root, build, port, expected_mac=None):
     for name in files.values():
         if not (build / name).is_file():
             raise RuntimeError('Missing artifact: ' + name)
+    mac = (
+        expected_mac.strip().lower()
+        if expected_mac is not None
+        else resolve_setting(root, 'RECEIVER_MAC', 'receiver_mac').lower()
+    )
+    if mac == 'xx:xx:xx:xx:xx:xx':
+        mac = ''
+    if not mac and not sys.stdin.isatty():
+        raise RuntimeError(
+            'RECEIVER_MAC is required for non-interactive receiver flash; '
+            'set RECEIVER_MAC or upload.local.json'
+        )
+    port = port.strip() if port else detect_receiver_port()
     base = [sys.executable, '-m', 'esptool', '--chip', 'esp32s3', '--port', port,
             '--before', 'default-reset']
     identity = subprocess.run(base + ['--after', 'no-reset', 'read-mac'], check=True,
                               capture_output=True, text=True, timeout=45)
-    if mac not in identity.stdout.lower():
-        raise RuntimeError('Wrong receiver; refusing to flash: ' + identity.stdout)
+    if mac:
+        if mac not in identity.stdout.lower():
+            raise RuntimeError('Wrong receiver; refusing to flash: ' + identity.stdout)
+    else:
+        print(f'Detected ESP32-S3 receiver on {port}:\n{identity.stdout.strip()}')
+        answer = input('Flash this receiver? [y/N]: ').strip().lower()
+        if answer not in ('y', 'yes'):
+            raise RuntimeError('Receiver flash cancelled by user')
     backups = root / '.backups'
     backups.mkdir(exist_ok=True)
     (backups / 'receiver-identity.txt').write_text(identity.stdout)

@@ -168,3 +168,7 @@ def upload(source, target, env):
 if 'Import' in globals():
     Import('env')
     env.Replace(UPLOAD_PROTOCOL="custom", UPLOADCMD=upload)
+    if env.subst('$PIOENV') == 'sender':
+        picosdk_dir = env.PioPlatform().get_package_dir('framework-picosdk')
+        mdns_src = os.path.join(picosdk_dir, 'lib', 'lwip', 'src', 'apps', 'mdns')
+        env.BuildSources(os.path.join('$BUILD_DIR', 'PicoSDKLwIPMDNS'), mdns_src)

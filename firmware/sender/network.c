@@ -6,6 +6,7 @@
 #include "lwip/udp.h"
 #include "lwip/dns.h"
 #include "lwip/netif.h"
+#include "lwip/apps/mdns.h"
 #include <stdio.h>
 #include <inttypes.h>
 #if __has_include("../wifi.local.h")
@@ -158,7 +159,14 @@ bool network_init(void) {
     cyw43_arch_enable_sta_mode();cyw43_arch_lwip_begin();
     bool ok=listen_port(502,false) && listen_port(80,true);
     ntp=udp_new();if(ntp)udp_recv(ntp,ntp_reply,NULL);else ok=false;
-    if(netif_default)netif_set_hostname(netif_default,"lora-wellhouse");
+    if(netif_default) {
+        netif_set_hostname(netif_default,"lora-wellhouse");
+        mdns_resp_init();
+        if(mdns_resp_add_netif(netif_default,"lora-wellhouse")==ERR_OK) {
+            mdns_resp_add_service(netif_default,"lora-wellhouse","_http",DNSSD_PROTO_TCP,80,NULL,NULL);
+            mdns_resp_add_service(netif_default,"lora-wellhouse","_modbus",DNSSD_PROTO_TCP,502,NULL,NULL);
+        }
+    }
     cyw43_arch_lwip_end();return ok;
 }
 bool network_connected(void){return connected;}
@@ -172,7 +180,10 @@ void network_poll(gw_sender *s,uint64_t now_us) {
             connect_try_ms=now+1000;
             if(!was_connected) {
                 cyw43_arch_lwip_begin();
-                if(netif_default)printf("Wi-Fi IP %s\n",ip4addr_ntoa(netif_ip4_addr(netif_default)));
+                if(netif_default) {
+                    printf("Wi-Fi IP %s (lora-wellhouse.local)\n",ip4addr_ntoa(netif_ip4_addr(netif_default)));
+                    mdns_resp_restart(netif_default);
+                }
                 cyw43_arch_lwip_end();
             }
         }

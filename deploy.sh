@@ -77,7 +77,7 @@ core = Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home() / '.platformio')).
 inputs = [root / 'deploy.sh', root / 'platformio.ini', root / 'firmware/config.h',
           root / 'firmware/wifi.example.h', root / '.build/link_id.h']
 if board == 'sender':
-    inputs += [root / 'firmware/wifi.local.h']
+    inputs += [root / '.build/wifi.h', root / 'firmware/wifi.local.h']
 inputs += sorted((root / 'firmware' / board).rglob('*'))
 inputs += sorted((root / 'firmware/gateway').rglob('*'))
 if board == 'receiver':
@@ -189,6 +189,46 @@ if not target.is_file() or target.read_text() != content:
     target.write_text(content)
 PY
 
+if [[ "$command_name" == flash && ( "$board" == sender || "$board" == all ) ]]; then
+"$python" - <<'PY'
+import getpass
+import os
+from pathlib import Path
+import sys
+
+def c_escape(s):
+    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
+
+target = Path('.build/wifi.h')
+if 'WIFI_SSID' in os.environ:
+    ssid = os.environ['WIFI_SSID']
+    password = os.environ.get('WIFI_PASSWORD', '')
+    ntp = os.environ.get('NTP_SERVER', 'pool.ntp.org')
+elif sys.stdin.isatty():
+    ssid = input('Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ').strip()
+    if ssid:
+        password = getpass.getpass('Enter Wi-Fi password (leave blank for open network): ')
+    else:
+        password = ''
+    ntp = os.environ.get('NTP_SERVER', 'pool.ntp.org')
+else:
+    raise SystemExit(0)
+
+content = (
+    '#pragma once\n'
+    f'#define WIFI_SSID "{c_escape(ssid)}"\n'
+    f'#define WIFI_PASSWORD "{c_escape(password)}"\n'
+    f'#define NTP_SERVER "{c_escape(ntp)}"\n'
+)
+if not target.is_file() or target.read_text() != content:
+    target.write_text(content)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+PY
+fi
+
 boards=(sender receiver)
 if [[ "$board" != all ]]; then boards=("$board"); fi
 for target_board in "${boards[@]}"; do
@@ -213,5 +253,65 @@ if [[ "$command_name" == flash ]]; then
         # nobuild uses the verified images above, without invoking compilation again.
         echo "$target_board: flashing..."
         "$python" -m platformio run -e "$target_board" -t nobuild -t upload
+        if [[ "$target_board" == sender && "${SKIP_WIFI_VERIFY:-0}" != 1 ]]; then
+            "$python" - <<'PY'
+import json
+import re
+import socket
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+def configured_ssid():
+    for path in (Path('.build/wifi.h'), Path('firmware/wifi.local.h')):
+        if path.is_file():
+            m = re.search(r'#define\s+WIFI_SSID\s+"([^"]*)"', path.read_text())
+            if m:
+                return m.group(1)
+    return ''
+
+ssid = configured_ssid()
+if not ssid:
+    print('sender: Wi-Fi skipped (no SSID configured); skipping connectivity check.')
+    raise SystemExit(0)
+
+cfg = Path('firmware/config.h').read_text()
+m = re.search(r'#define\s+DEVICE_HOSTNAME\s+"([^"]+)"', cfg)
+host = (m.group(1) if m else 'wellhouse-modbus-bridge') + '.local'
+url = f'http://{host}/pump/status'
+
+def wait_for_wifi(timeout_s):
+    print(f'sender: waiting up to {timeout_s}s for Wi-Fi connectivity at {url} ...', flush=True)
+    deadline = time.monotonic() + timeout_s
+    last_err = ''
+    while time.monotonic() < deadline:
+        try:
+            ip = socket.gethostbyname(host)
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+            if resp.status == 200 and data.get('wifi'):
+                print(f'sender: Wi-Fi verified! http://{host}/ (IP {ip})')
+                return True
+            last_err = f'unexpected status/payload: {resp.status} {data}'
+        except Exception as exc:
+            last_err = str(exc)
+        time.sleep(2)
+    print(f'sender: could not verify Wi-Fi at {url} ({last_err}).', file=sys.stderr)
+    return False
+
+timeout = 45
+while not wait_for_wifi(timeout):
+    if not sys.stdin.isatty():
+        raise SystemExit(1)
+    ans = input('Check SSID/password or USB serial log. [r]etry (30s), [c]ontinue anyway, or [A]bort? ').strip().lower()
+    if ans in ('r', 'retry'):
+        timeout = 30
+        continue
+    if ans in ('c', 'continue'):
+        break
+    raise SystemExit(1)
+PY
+        fi
     done
 fi

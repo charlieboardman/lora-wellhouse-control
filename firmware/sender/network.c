@@ -10,7 +10,9 @@
 #include "lwip/apps/mdns.h"
 #include <stdio.h>
 #include <inttypes.h>
-#if __has_include("../wifi.local.h")
+#if __has_include("../../.build/wifi.h")
+#include "../../.build/wifi.h"
+#elif __has_include("../wifi.local.h")
 #include "../wifi.local.h"
 #else
 #include "../wifi.example.h"

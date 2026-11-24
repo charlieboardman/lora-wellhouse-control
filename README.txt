@@ -167,21 +167,21 @@ invocations are serialized by a lock so they do not modify builds simultaneously
 Wi-Fi configuration
 ~~~~~~~~~~~~~~~~~~~
 
-Copy the template once:
+When flashing the sender (bash deploy.sh flash sender or flash all), deploy.sh
+prompts for your Wi-Fi SSID and password (password input is hidden; leave SSID
+blank to skip Wi-Fi), compiles them into the sender image via .build/wifi.h,
+and after flashing waits up to 45 seconds to verify that the Pico comes online
+at http://wellhouse-modbus-bridge.local/pump/status before continuing.
+
+For non-interactive flashes you can pass WIFI_SSID and WIFI_PASSWORD in the
+environment (plus SKIP_WIFI_VERIFY=1 if flashing from a different network), or
+pre-create a gitignored firmware/wifi.local.h from firmware/wifi.example.h:
 
   cp firmware/wifi.example.h firmware/wifi.local.h
 
-Edit firmware/wifi.local.h:
-
-  #pragma once
-  #define WIFI_SSID "your-network"
-  #define WIFI_PASSWORD "your-password"
-  #define NTP_SERVER "pool.ntp.org"
-
-Do not commit credentials. Git ignores wifi.local.h. If it is absent, the empty
-example settings are used: the firmware builds and float/radio operation works,
-but there is no Wi-Fi client access. Wi-Fi settings are compiled into the image,
-so changing them requires rebuilding and flashing the Pico.
+Without credentials, the firmware builds and float/radio operation works, but
+there is no Wi-Fi client access. Wi-Fi settings are compiled into the image, so
+changing them requires reflashing the Pico.
 
 The Pico uses DHCP, requests hostname wellhouse-modbus-bridge, advertises
 wellhouse-modbus-bridge.local over mDNS (_http._tcp:80 and _modbus._tcp:502),

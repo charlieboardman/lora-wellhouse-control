@@ -31,7 +31,17 @@ int main() {
     tcp[4]=1;tcp[5]=0;assert(gw_mbap(tcp,sizeof(tcp),&size)==-1);
     const char *http="POST /pump/pause HTTP/1.1\r\nHost: pico\r\nContent-Length: 0\r\n\r\n";
     assert(gw_http(http,strlen(http))==HTTP_PAUSE);
+    http="GET / HTTP/1.1\r\n\r\n";assert(gw_http(http,strlen(http))==HTTP_INDEX);
     http="GET /pump/status HTTP/1.1\r\n\r\n";assert(gw_http(http,strlen(http))==HTTP_STATUS);
+    http="POST /modbus/send?pdu=010321000001 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+    assert(gw_http(http,strlen(http))==HTTP_MODBUS);
+    uint8_t pdu[16]={};assert(gw_http_modbus_pdu(http,strlen(http),pdu,sizeof(pdu))==6);
+    const uint8_t exp_pdu[]={1,3,0x21,0,0,1};assert(memcmp(pdu,exp_pdu,6)==0);
+    http="POST /modbus/send?pdu=010 HTTP/1.1\r\n\r\n";
+    assert(gw_http(http,strlen(http))==HTTP_MODBUS);
+    assert(gw_http_modbus_pdu(http,strlen(http),pdu,sizeof(pdu))==0);
+    http="POST /modbus/send?pdu=01zz HTTP/1.1\r\n\r\n";
+    assert(gw_http_modbus_pdu(http,strlen(http),pdu,sizeof(pdu))==0);
     http="POST /pump/resume HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";assert(gw_http(http,strlen(http))==HTTP_BAD);
     http="POST /pump/resume HTTP/1.1\r\nContent-Length: x\r\n\r\n";assert(gw_http(http,strlen(http))==HTTP_BAD);
     http="POST /pump/resume HTTP/1.1\r\nContent-Length: 0\r\n\r\nx";assert(gw_http(http,strlen(http))==HTTP_BAD);

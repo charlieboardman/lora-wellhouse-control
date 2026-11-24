@@ -446,13 +446,16 @@ commanded state, not feedback that the pump physically started or stopped.
 HTTP API
 ~~~~~~~~
 
-The Pico listens on port 80. Requests have no body. Use the exact routes below;
-this is a small control API, not a web dashboard.
+The Pico listens on port 80. Requests have no body. Opening http://wellhouse-modbus-bridge.local/
+in a browser serves a small built-in page showing live pump/link status,
+pause/resume buttons, and a raw Modbus command sender.
 
-  POST /pump/pause          Pause for one hour
-  POST /pump/resume         End the pause early
-  GET  /pump/status        Read local state and last observed receiver state
-  GET  /modbus/last-result  Read metadata for the last completed gateway operation
+  GET  /                         Built-in status and Modbus command page
+  POST /pump/pause               Pause for one hour
+  POST /pump/resume              End the pause early
+  GET  /pump/status              Read local state and last observed receiver state
+  GET  /modbus/last-result       Read metadata for the last completed gateway operation
+  POST /modbus/send?pdu=<hex>    Queue a raw Modbus PDU (unit + func + data) over LoRa
 
 Examples, replacing PICO_IP with the DHCP address:
 

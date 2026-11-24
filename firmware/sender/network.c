@@ -1,4 +1,5 @@
 #include "network.h"
+#include "web_ui.h"
 #include "../gateway/frontend.h"
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
@@ -23,10 +24,11 @@
 typedef struct {
     struct tcp_pcb *pcb;
     uint32_t generation;
-    bool http,closing,waiting;
+    bool http,closing,waiting,waiting_modbus;
     unsigned outstanding;
     uint64_t last_ms;
-    size_t used,out_used;
+    size_t used,out_used,static_left;
+    const uint8_t *static_out;
     uint8_t input[BUFFER_SIZE],output[BUFFER_SIZE];
 } connection;
 static connection clients[CONNECTIONS];
@@ -38,9 +40,9 @@ static unsigned ntp_backoff=10;
 
 static void drop(connection *c) {
     if(c->pcb) {tcp_arg(c->pcb,NULL);tcp_recv(c->pcb,NULL);tcp_err(c->pcb,NULL);tcp_abort(c->pcb);}
-    c->pcb=NULL;c->used=c->out_used=0;c->waiting=false;c->outstanding=0;
+    c->pcb=NULL;c->used=c->out_used=c->static_left=0;c->static_out=NULL;c->waiting=c->waiting_modbus=false;c->outstanding=0;
 }
-static void broken(void *arg,err_t err) {(void)err;connection *c=arg;if(c){c->pcb=NULL;c->used=c->out_used=0;c->waiting=false;c->outstanding=0;}}
+static void broken(void *arg,err_t err) {(void)err;connection *c=arg;if(c){c->pcb=NULL;c->used=c->out_used=c->static_left=0;c->static_out=NULL;c->waiting=c->waiting_modbus=false;c->outstanding=0;}}
 static err_t received(void *arg,struct tcp_pcb *pcb,struct pbuf *p,err_t err) {
     (void)pcb;connection *c=arg;
     if(!p) {drop(c);return ERR_ABRT;}
@@ -82,14 +84,32 @@ static void modbus_response(connection *c,uint16_t id,const uint8_t *p,size_t n,
     else memcpy(frame+6,p,n);
     output(c,frame,size+6);
 }
-void gw_deliver(uint32_t client,uint16_t id,const uint8_t *p,size_t n,uint8_t error) {
-    cyw43_arch_lwip_begin();connection *c=lookup(client);
-    if(c && !c->http){if(c->outstanding)--c->outstanding;modbus_response(c,id,p,n,error);}
-    cyw43_arch_lwip_end();
-}
 static void http_response(connection *c,unsigned status,const char *json) {
     char header[200];int n=snprintf(header,sizeof(header),"HTTP/1.1 %u %s\r\nContent-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",status,status==200?"OK":status==504?"Gateway Timeout":status==503?"Service Unavailable":status==404?"Not Found":"Bad Request",(unsigned)strlen(json));
-    output(c,header,(size_t)n);if(c->pcb)output(c,json,strlen(json));c->closing=true;c->waiting=false;
+    output(c,header,(size_t)n);if(c->pcb)output(c,json,strlen(json));c->closing=true;c->waiting=c->waiting_modbus=false;
+}
+static void http_html(connection *c,const char *html,size_t len) {
+    char header[200];int n=snprintf(header,sizeof(header),"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %u\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",(unsigned)len);
+    output(c,header,(size_t)n);if(c->pcb){c->static_out=(const uint8_t *)html;c->static_left=len;}c->closing=true;c->waiting=c->waiting_modbus=false;
+}
+void gw_deliver(uint32_t client,uint16_t id,const uint8_t *p,size_t n,uint8_t error) {
+    cyw43_arch_lwip_begin();connection *c=lookup(client);
+    if(c) {
+        if(!c->http){if(c->outstanding)--c->outstanding;modbus_response(c,id,p,n,error);}
+        else if(c->waiting_modbus) {
+            char json[700];
+            if(error) {
+                snprintf(json,sizeof(json),"{\"ok\":false,\"error\":%u,\"unit\":%u,\"function\":%u}",error,n>0?p[0]:0,n>1?p[1]:0);
+            } else {
+                static const char hx[]="0123456789abcdef";
+                int pos=snprintf(json,sizeof(json),"{\"ok\":true,\"unit\":%u,\"function\":%u,\"hex\":\"",n>0?p[0]:0,n>1?p[1]:0);
+                for(size_t i=0;i<n && pos+4<(int)sizeof(json);i++){json[pos++]=hx[p[i]>>4];json[pos++]=hx[p[i]&15];}
+                json[pos++]='"';json[pos++]='}';json[pos]=0;
+            }
+            http_response(c,200,json);
+        }
+    }
+    cyw43_arch_lwip_end();
 }
 void gw_control_done(uint32_t client,bool confirmed) {
     cyw43_arch_lwip_begin();connection *c=lookup(client);
@@ -109,14 +129,23 @@ static void parse_modbus(connection *c,gw_sender *s,uint64_t now) {
     }
 }
 static void parse_http(connection *c,gw_sender *s,uint64_t now) {
-    if(c->waiting || c->closing)return;
+    if(c->waiting || c->waiting_modbus || c->closing)return;
     if(c->used==sizeof(c->input)){http_response(c,400,"{\"error\":\"headers too large\"}");return;}
     c->input[c->used]=0;
     enum gw_http_route route=gw_http((char *)c->input,c->used);
     if(route==HTTP_INCOMPLETE)return;
     if(route==HTTP_BAD){http_response(c,400,"{\"error\":\"invalid request\"}");return;}
     char json[700];
-    if(route==HTTP_PAUSE || route==HTTP_RESUME) {
+    if(route==HTTP_INDEX) {
+        http_html(c,WEB_UI_HTML,sizeof(WEB_UI_HTML)-1);
+    } else if(route==HTTP_MODBUS) {
+        uint8_t pdu[GW_DATA_MAX];
+        size_t n=gw_http_modbus_pdu((char *)c->input,c->used,pdu,sizeof(pdu));
+        if(n<2){http_response(c,400,"{\"ok\":false,\"error\":3}");return;}
+        uint8_t err=gw_sender_submit(s,token(c),0,pdu,n,now);
+        if(err){snprintf(json,sizeof(json),"{\"ok\":false,\"error\":%u,\"unit\":%u,\"function\":%u}",err,pdu[0],pdu[1]);http_response(c,err==6?503:400,json);}
+        else c->waiting_modbus=true;
+    } else if(route==HTTP_PAUSE || route==HTTP_RESUME) {
         if(!gw_sender_control(s,route==HTTP_PAUSE,token(c),now))http_response(c,503,"{\"error\":\"control pending\"}");
         else c->waiting=true;
     } else if(route==HTTP_STATUS) {
@@ -209,8 +238,13 @@ void network_poll(gw_sender *s,uint64_t now_us) {
             if(n && tcp_write(c->pcb,c->output,(u16_t)n,TCP_WRITE_FLAG_COPY)==ERR_OK) {
                 memmove(c->output,c->output+n,c->out_used-n);c->out_used-=n;tcp_output(c->pcb);
             }
+        } else if(c->static_left) {
+            size_t n=c->static_left;if(n>tcp_sndbuf(c->pcb))n=tcp_sndbuf(c->pcb);
+            if(n && tcp_write(c->pcb,c->static_out,(u16_t)n,0)==ERR_OK) {
+                c->static_out+=n;c->static_left-=n;tcp_output(c->pcb);
+            }
         }
-        if(c->closing && !c->out_used) {
+        if(c->closing && !c->out_used && !c->static_left) {
             tcp_arg(c->pcb,NULL);tcp_recv(c->pcb,NULL);tcp_err(c->pcb,NULL);
             if(tcp_close(c->pcb)==ERR_OK)c->pcb=NULL;
             else {tcp_arg(c->pcb,c);tcp_recv(c->pcb,received);tcp_err(c->pcb,broken);}

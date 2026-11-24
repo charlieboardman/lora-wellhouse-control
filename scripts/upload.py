@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 ESPRESSIF_VID = 0x303A
 
@@ -39,8 +40,7 @@ def _fat_mount_points():
     return mounts
 
 
-def detect_sender_port(mounts=None):
-    candidates = _fat_mount_points() if mounts is None else [Path(m) for m in mounts]
+def _find_rp2350_mounts(candidates):
     matches = []
     for mount in candidates:
         info = mount / 'INFO_UF2.TXT'
@@ -49,6 +49,52 @@ def detect_sender_port(mounts=None):
                 matches.append(str(mount))
         except OSError:
             continue
+    return matches
+
+
+def _try_mount_rp2350():
+    dev = Path('/dev/disk/by-label/RP2350')
+    if not dev.exists():
+        return
+    try:
+        subprocess.run(['udisksctl', 'mount', '-b', str(dev)],
+                       capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _trigger_pico_bootsel(by_id_dir=Path('/dev/serial/by-id')):
+    if not by_id_dir.is_dir():
+        return False
+    picos = [str(e) for e in sorted(by_id_dir.iterdir())
+             if 'raspberry_pi_pico' in e.name.lower()]
+    if len(picos) != 1:
+        return False
+    try:
+        import serial
+        print('Found running Pico at', picos[0], '- requesting BOOTSEL via 1200 baud...')
+        with serial.Serial(picos[0], 1200) as ser:
+            ser.dtr = False
+            time.sleep(0.1)
+        return True
+    except Exception:
+        return False
+
+
+def detect_sender_port(mounts=None):
+    if mounts is not None:
+        matches = _find_rp2350_mounts([Path(m) for m in mounts])
+    else:
+        matches = _find_rp2350_mounts(_fat_mount_points())
+        if not matches:
+            _try_mount_rp2350()
+            matches = _find_rp2350_mounts(_fat_mount_points())
+        if not matches and _trigger_pico_bootsel():
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline and not matches:
+                time.sleep(0.5)
+                _try_mount_rp2350()
+                matches = _find_rp2350_mounts(_fat_mount_points())
     if len(matches) == 1:
         print('Auto-detected RP2350 sender at', matches[0])
         return matches[0]

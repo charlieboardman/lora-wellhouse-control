@@ -3,6 +3,7 @@
 
 // User settings. GP numbers, not physical header pin numbers.
 #define FIRMWARE_VERSION "2.0.0"
+#define DEVICE_HOSTNAME "wellhouse-modbus-bridge"
 #define FLOAT_GPIO 0u                 // GP0 / physical pin 1; switch to GND (pin 3).
 #define SAMPLE_INTERVAL_MS UINT64_C(1000)
 #define ON_INTERVAL_MS UINT64_C(30000)

@@ -160,11 +160,11 @@ bool network_init(void) {
     bool ok=listen_port(502,false) && listen_port(80,true);
     ntp=udp_new();if(ntp)udp_recv(ntp,ntp_reply,NULL);else ok=false;
     if(netif_default) {
-        netif_set_hostname(netif_default,"lora-wellhouse");
+        netif_set_hostname(netif_default,DEVICE_HOSTNAME);
         mdns_resp_init();
-        if(mdns_resp_add_netif(netif_default,"lora-wellhouse")==ERR_OK) {
-            mdns_resp_add_service(netif_default,"lora-wellhouse","_http",DNSSD_PROTO_TCP,80,NULL,NULL);
-            mdns_resp_add_service(netif_default,"lora-wellhouse","_modbus",DNSSD_PROTO_TCP,502,NULL,NULL);
+        if(mdns_resp_add_netif(netif_default,DEVICE_HOSTNAME)==ERR_OK) {
+            mdns_resp_add_service(netif_default,DEVICE_HOSTNAME,"_http",DNSSD_PROTO_TCP,80,NULL,NULL);
+            mdns_resp_add_service(netif_default,DEVICE_HOSTNAME,"_modbus",DNSSD_PROTO_TCP,502,NULL,NULL);
         }
     }
     cyw43_arch_lwip_end();return ok;
@@ -181,7 +181,7 @@ void network_poll(gw_sender *s,uint64_t now_us) {
             if(!was_connected) {
                 cyw43_arch_lwip_begin();
                 if(netif_default) {
-                    printf("Wi-Fi IP %s (lora-wellhouse.local)\n",ip4addr_ntoa(netif_ip4_addr(netif_default)));
+                    printf("Wi-Fi IP %s (" DEVICE_HOSTNAME ".local)\n",ip4addr_ntoa(netif_ip4_addr(netif_default)));
                     mdns_resp_restart(netif_default);
                 }
                 cyw43_arch_lwip_end();

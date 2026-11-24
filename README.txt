@@ -183,11 +183,11 @@ example settings are used: the firmware builds and float/radio operation works,
 but there is no Wi-Fi client access. Wi-Fi settings are compiled into the image,
 so changing them requires rebuilding and flashing the Pico.
 
-The Pico uses DHCP, requests hostname lora-wellhouse, advertises
-lora-wellhouse.local over mDNS (_http._tcp:80 and _modbus._tcp:502), and logs
-its assigned IP on USB serial. Clients on the same LAN can connect to
-lora-wellhouse.local without router DNS or static IP configuration, or use the
-logged IP directly.
+The Pico uses DHCP, requests hostname wellhouse-modbus-bridge, advertises
+wellhouse-modbus-bridge.local over mDNS (_http._tcp:80 and _modbus._tcp:502),
+and logs its assigned IP on USB serial. Clients on the same LAN can connect to
+wellhouse-modbus-bridge.local without router DNS or static IP configuration, or
+use the logged IP directly.
 
 Shared configuration
 ~~~~~~~~~~~~~~~~~~~~

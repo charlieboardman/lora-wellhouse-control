@@ -215,14 +215,30 @@ if not target.is_file() or target.read_text() != content:
 
 if [[ "$command_name" == flash && ( "$board" == sender || "$board" == all ) ]]; then
 "$python" -c '
-import getpass
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 def c_escape(s):
     return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "")
+
+def laptop_wifi():
+    try:
+        r = subprocess.run(["nmcli", "device", "wifi", "show-password"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return "", ""
+        ssid = password = ""
+        for line in r.stdout.splitlines():
+            if line.startswith("SSID:"):
+                ssid = line.split(":", 1)[1].strip()
+            elif line.startswith("Password:"):
+                password = line.split(":", 1)[1].strip()
+        return ssid, password
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
 
 target = Path(".build/wifi.h")
 saved_ssid = ""
@@ -236,19 +252,32 @@ if "WIFI_SSID" in os.environ:
     password = os.environ.get("WIFI_PASSWORD", "")
     ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
 elif sys.stdin.isatty():
-    if saved_ssid:
+    cur_ssid, cur_pass = laptop_wifi()
+    ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
+    if cur_ssid:
+        print(f"Wi-Fi options:")
+        print(f"  1) Use laptop current Wi-Fi (\"{cur_ssid}\") [default]")
+        print(f"  2) Enter SSID and password manually (visible)")
+        print(f"  3) Skip Wi-Fi")
+        choice = input("Select [1-3]: ").strip()
+        if choice in ("", "1"):
+            ssid, password = cur_ssid, cur_pass
+            print(f"Using laptop Wi-Fi \"{ssid}\".")
+        elif choice == "3":
+            ssid, password = "", ""
+        else:
+            ssid = input("Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ").strip()
+            password = input("Enter Wi-Fi password (leave blank for open network): ") if ssid else ""
+    elif saved_ssid:
         ans = input(f"Enter Wi-Fi SSID [Enter to reuse \"{saved_ssid}\", or \"-\" to skip Wi-Fi]: ").strip()
         if not ans:
             print(f"Reusing saved Wi-Fi credentials for \"{saved_ssid}\".")
             raise SystemExit(0)
         ssid = "" if ans == "-" else ans
+        password = input("Enter Wi-Fi password (leave blank for open network): ") if ssid else ""
     else:
         ssid = input("Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ").strip()
-    if ssid:
-        password = getpass.getpass("Enter Wi-Fi password (leave blank for open network): ")
-    else:
-        password = ""
-    ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
+        password = input("Enter Wi-Fi password (leave blank for open network): ") if ssid else ""
 else:
     raise SystemExit(0)
 

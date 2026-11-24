@@ -72,13 +72,23 @@ def _trigger_pico_bootsel(by_id_dir=Path('/dev/serial/by-id')):
         return False
     try:
         import serial
-        print('Found running Pico at', picos[0], '- requesting BOOTSEL via 1200 baud...')
-        with serial.Serial(picos[0], 1200) as ser:
+    except ImportError:
+        return False
+    print('Found running Pico at', picos[0], '- requesting BOOTSEL via 1200 baud...')
+    try:
+        ser = serial.Serial(picos[0], 1200)
+        try:
             ser.dtr = False
             time.sleep(0.1)
-        return True
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
     except Exception:
-        return False
+        # Device often disconnects immediately on 1200-baud reboot, which raises I/O error.
+        pass
+    return True
 
 
 def detect_sender_port(mounts=None):

@@ -142,83 +142,83 @@ done
 "$python" tests/interop_test.py
 [[ "$command_name" != test ]] || exit 0
 
-"$python" - "$command_name" <<'PY'
+"$python" -c '
 import os
 from pathlib import Path
 import secrets
 import sys
 
 command = sys.argv[1]
-target = Path('.build/link_id.h')
-raw = os.environ.get('GW_LINK_ID', '').strip()
+target = Path(".build/link_id.h")
+raw = os.environ.get("GW_LINK_ID", "").strip()
 
 def parse_link_id(text):
     cleaned = text.strip().lower()
-    if cleaned.startswith('0x'):
+    if cleaned.startswith("0x"):
         cleaned = cleaned[2:]
-    if not cleaned or len(cleaned) > 16 or any(c not in '0123456789abcdef' for c in cleaned):
-        raise SystemExit(f'Invalid GW_LINK_ID "{text}": expected 1-16 hex digits (optional 0x prefix).')
+    if not cleaned or len(cleaned) > 16 or any(c not in "0123456789abcdef" for c in cleaned):
+        raise SystemExit(f"Invalid GW_LINK_ID \"{text}\": expected 1-16 hex digits (optional 0x prefix).")
     value = int(cleaned, 16)
     if value == 0:
-        raise SystemExit('Invalid GW_LINK_ID: must be non-zero.')
+        raise SystemExit("Invalid GW_LINK_ID: must be non-zero.")
     return value
 
-if command == 'flash':
+if command == "flash":
     if not raw:
         if not sys.stdin.isatty():
-            raise SystemExit('GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=0x... bash deploy.sh flash).')
-        raw = input('Enter shared 64-bit hex link ID (or press Enter to generate one): ').strip()
+            raise SystemExit("GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=0x... bash deploy.sh flash).")
+        raw = input("Enter shared 64-bit hex link ID (or press Enter to generate one): ").strip()
         if not raw:
             value = secrets.randbits(64) or 1
-            print(f'Generated GW_LINK_ID=0x{value:016x} (use this same ID on both boards).')
+            print(f"Generated GW_LINK_ID=0x{value:016x} (use this same ID on both boards).")
         else:
             value = parse_link_id(raw)
     else:
         value = parse_link_id(raw)
-    content = f'#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n'
+    content = f"#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n"
 elif raw:
     value = parse_link_id(raw)
-    content = f'#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n'
+    content = f"#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n"
 elif target.is_file():
     raise SystemExit(0)
 else:
-    print('Note: using build-check link ID only; flash will prompt for your shared link ID.')
-    content = '#pragma once\n#define GW_LINK_ID UINT64_C(0x0000000000000001) /* build-check only */\n'
+    print("Note: using build-check link ID only; flash will prompt for your shared link ID.")
+    content = "#pragma once\n#define GW_LINK_ID UINT64_C(0x0000000000000001) /* build-check only */\n"
 
 if not target.is_file() or target.read_text() != content:
     target.write_text(content)
-PY
+' "$command_name"
 
 if [[ "$command_name" == flash && ( "$board" == sender || "$board" == all ) ]]; then
-"$python" - <<'PY'
+"$python" -c '
 import getpass
 import os
 from pathlib import Path
 import sys
 
 def c_escape(s):
-    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '').replace('\r', '')
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "")
 
-target = Path('.build/wifi.h')
-if 'WIFI_SSID' in os.environ:
-    ssid = os.environ['WIFI_SSID']
-    password = os.environ.get('WIFI_PASSWORD', '')
-    ntp = os.environ.get('NTP_SERVER', 'pool.ntp.org')
+target = Path(".build/wifi.h")
+if "WIFI_SSID" in os.environ:
+    ssid = os.environ["WIFI_SSID"]
+    password = os.environ.get("WIFI_PASSWORD", "")
+    ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
 elif sys.stdin.isatty():
-    ssid = input('Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ').strip()
+    ssid = input("Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ").strip()
     if ssid:
-        password = getpass.getpass('Enter Wi-Fi password (leave blank for open network): ')
+        password = getpass.getpass("Enter Wi-Fi password (leave blank for open network): ")
     else:
-        password = ''
-    ntp = os.environ.get('NTP_SERVER', 'pool.ntp.org')
+        password = ""
+    ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
 else:
     raise SystemExit(0)
 
 content = (
-    '#pragma once\n'
-    f'#define WIFI_SSID "{c_escape(ssid)}"\n'
-    f'#define WIFI_PASSWORD "{c_escape(password)}"\n'
-    f'#define NTP_SERVER "{c_escape(ntp)}"\n'
+    "#pragma once\n"
+    f"#define WIFI_SSID \"{c_escape(ssid)}\"\n"
+    f"#define WIFI_PASSWORD \"{c_escape(password)}\"\n"
+    f"#define NTP_SERVER \"{c_escape(ntp)}\"\n"
 )
 if not target.is_file() or target.read_text() != content:
     target.write_text(content)
@@ -226,7 +226,7 @@ if not target.is_file() or target.read_text() != content:
         os.chmod(target, 0o600)
     except OSError:
         pass
-PY
+'
 fi
 
 boards=(sender receiver)
@@ -254,7 +254,7 @@ if [[ "$command_name" == flash ]]; then
         echo "$target_board: flashing..."
         "$python" -m platformio run -e "$target_board" -t nobuild -t upload
         if [[ "$target_board" == sender && "${SKIP_WIFI_VERIFY:-0}" != 1 ]]; then
-            "$python" - <<'PY'
+            "$python" -c '
 import json
 import re
 import socket
@@ -264,54 +264,54 @@ import urllib.request
 from pathlib import Path
 
 def configured_ssid():
-    for path in (Path('.build/wifi.h'), Path('firmware/wifi.local.h')):
+    for path in (Path(".build/wifi.h"), Path("firmware/wifi.local.h")):
         if path.is_file():
-            m = re.search(r'#define\s+WIFI_SSID\s+"([^"]*)"', path.read_text())
+            m = re.search(r"#define\s+WIFI_SSID\s+\"([^\"]*)\"", path.read_text())
             if m:
                 return m.group(1)
-    return ''
+    return ""
 
 ssid = configured_ssid()
 if not ssid:
-    print('sender: Wi-Fi skipped (no SSID configured); skipping connectivity check.')
+    print("sender: Wi-Fi skipped (no SSID configured); skipping connectivity check.")
     raise SystemExit(0)
 
-cfg = Path('firmware/config.h').read_text()
-m = re.search(r'#define\s+DEVICE_HOSTNAME\s+"([^"]+)"', cfg)
-host = (m.group(1) if m else 'wellhouse-modbus-bridge') + '.local'
-url = f'http://{host}/pump/status'
+cfg = Path("firmware/config.h").read_text()
+m = re.search(r"#define\s+DEVICE_HOSTNAME\s+\"([^\"]+)\"", cfg)
+host = (m.group(1) if m else "wellhouse-modbus-bridge") + ".local"
+url = f"http://{host}/pump/status"
 
 def wait_for_wifi(timeout_s):
-    print(f'sender: waiting up to {timeout_s}s for Wi-Fi connectivity at {url} ...', flush=True)
+    print(f"sender: waiting up to {timeout_s}s for Wi-Fi connectivity at {url} ...", flush=True)
     deadline = time.monotonic() + timeout_s
-    last_err = ''
+    last_err = ""
     while time.monotonic() < deadline:
         try:
             ip = socket.gethostbyname(host)
             with urllib.request.urlopen(url, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
-            if resp.status == 200 and data.get('wifi'):
-                print(f'sender: Wi-Fi verified! http://{host}/ (IP {ip})')
+            if resp.status == 200 and data.get("wifi"):
+                print(f"sender: Wi-Fi verified! http://{host}/ (IP {ip})")
                 return True
-            last_err = f'unexpected status/payload: {resp.status} {data}'
+            last_err = f"unexpected status/payload: {resp.status} {data}"
         except Exception as exc:
             last_err = str(exc)
         time.sleep(2)
-    print(f'sender: could not verify Wi-Fi at {url} ({last_err}).', file=sys.stderr)
+    print(f"sender: could not verify Wi-Fi at {url} ({last_err}).", file=sys.stderr)
     return False
 
 timeout = 45
 while not wait_for_wifi(timeout):
     if not sys.stdin.isatty():
         raise SystemExit(1)
-    ans = input('Check SSID/password or USB serial log. [r]etry (30s), [c]ontinue anyway, or [A]bort? ').strip().lower()
-    if ans in ('r', 'retry'):
+    ans = input("Check SSID/password or USB serial log. [r]etry (30s), [c]ontinue anyway, or [A]bort? ").strip().lower()
+    if ans in ("r", "retry"):
         timeout = 30
         continue
-    if ans in ('c', 'continue'):
+    if ans in ("c", "continue"):
         break
     raise SystemExit(1)
-PY
+'
         fi
     done
 fi

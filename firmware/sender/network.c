@@ -130,6 +130,11 @@ static void parse_modbus(connection *c,gw_sender *s,uint64_t now) {
         if(c->pcb)consume(c,n+6);
     }
 }
+static const char *u64_fmt(uint64_t v,char buf[21]) {
+    char *p=buf+20;*p=0;
+    do {*--p=(char)('0'+(v%10));v/=10;} while(v);
+    return p;
+}
 static void parse_http(connection *c,gw_sender *s,uint64_t now) {
     if(c->waiting || c->waiting_modbus || c->closing)return;
     if(c->used==sizeof(c->input)){http_response(c,400,"{\"error\":\"headers too large\"}");return;}
@@ -151,10 +156,29 @@ static void parse_http(connection *c,gw_sender *s,uint64_t now) {
         if(!gw_sender_control(s,route==HTTP_PAUSE,token(c),now))http_response(c,503,"{\"error\":\"control pending\"}");
         else c->waiting=true;
     } else if(route==HTTP_STATUS) {
-        snprintf(json,sizeof(json),"{\"float_grounded\":%s,\"receiver_commanded_on\":%s,\"receiver_status_age_ms\":%" PRIu64 ",\"receiver_pause_remaining_ms\":%" PRIu64 ",\"last_on_ack_ms\":%" PRIu64 ",\"receiver_session\":%" PRIu64 ",\"wifi\":%s,\"pause_remaining_ms\":%" PRIu64 ",\"clock_synced\":%s,\"utc_us\":%" PRIu64 ",\"receiver_clock_synced\":%s,\"receiver_clock_sync_age_ms\":%" PRIu64 ",\"clock_sync_age_ms\":%" PRIu64 ",\"queued\":%u}",s->grounded?"true":"false",s->receiver_on?"true":"false",s->receiver_status_ms?now-s->receiver_status_ms:0,s->receiver_pause_until_ms>now?s->receiver_pause_until_ms-now:0,s->last_on_ack_ms,s->peer,connected?"true":"false",s->pause_until_ms>now?s->pause_until_ms-now:0,s->clock.valid?"true":"false",gw_utc(&s->clock,now*1000),s->receiver_clock_synced?"true":"false",s->receiver_clock_synced?now-s->receiver_clock_sync_ms:0,s->clock.valid?now-s->clock.synced_ms:0,s->count);
+        char b0[21],b1[21],b2[21],b3[21],b4[21],b5[21],b6[21],b7[21];
+        snprintf(json,sizeof(json),
+            "{\"float_grounded\":%s,\"receiver_commanded_on\":%s,\"receiver_status_age_ms\":%s,"
+            "\"receiver_pause_remaining_ms\":%s,\"last_on_ack_ms\":%s,\"receiver_session\":%s,"
+            "\"wifi\":%s,\"pause_remaining_ms\":%s,\"clock_synced\":%s,\"utc_us\":%s,"
+            "\"receiver_clock_synced\":%s,\"receiver_clock_sync_age_ms\":%s,\"clock_sync_age_ms\":%s,\"queued\":%u}",
+            s->grounded?"true":"false",s->receiver_on?"true":"false",
+            u64_fmt(s->receiver_status_ms?now-s->receiver_status_ms:0,b0),
+            u64_fmt(s->receiver_pause_until_ms>now?s->receiver_pause_until_ms-now:0,b1),
+            u64_fmt(s->last_on_ack_ms,b2),u64_fmt(s->peer,b3),connected?"true":"false",
+            u64_fmt(s->pause_until_ms>now?s->pause_until_ms-now:0,b4),s->clock.valid?"true":"false",
+            u64_fmt(gw_utc(&s->clock,now*1000),b5),s->receiver_clock_synced?"true":"false",
+            u64_fmt(s->receiver_clock_synced?now-s->receiver_clock_sync_ms:0,b6),
+            u64_fmt(s->clock.valid?now-s->clock.synced_ms:0,b7),s->count);
         http_response(c,200,json);
     } else if(route==HTTP_RESULT) {
-        snprintf(json,sizeof(json),"{\"transaction\":%u,\"tcp_transaction\":%u,\"client\":%u,\"unit\":%u,\"function\":%u,\"error\":%u,\"acquired_utc_us\":%" PRIu64 ",\"synchronized\":%s,\"receiver_sync_age_ms\":%" PRIu64 "}",(unsigned)s->completed_id,s->last_tcp_id,(unsigned)s->last_result_client,s->last_unit,s->last_function,s->last_error,s->last_acquired_us,s->last_result_synced?"true":"false",s->last_sync_age);
+        char b0[21],b1[21];
+        snprintf(json,sizeof(json),
+            "{\"transaction\":%u,\"tcp_transaction\":%u,\"client\":%u,\"unit\":%u,\"function\":%u,"
+            "\"error\":%u,\"acquired_utc_us\":%s,\"synchronized\":%s,\"receiver_sync_age_ms\":%s}",
+            (unsigned)s->completed_id,s->last_tcp_id,(unsigned)s->last_result_client,s->last_unit,
+            s->last_function,s->last_error,u64_fmt(s->last_acquired_us,b0),
+            s->last_result_synced?"true":"false",u64_fmt(s->last_sync_age,b1));
         http_response(c,200,json);
     } else http_response(c,404,"{\"error\":\"not found\"}");
 }

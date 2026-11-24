@@ -190,10 +190,11 @@ int main(void) {
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led);
         }
         if (now >= log_ms) {
-            printf("HEALTH ready=%d float=%d phase=%d queued=%u peer=%" PRIu64
-                   " synced=%d t=%" PRIu64 "\n",
-                   ready, sender.grounded, phase, sender.count, sender.peer, sender.clock.valid,
-                   now);
+            printf("HEALTH ready=%d float=%d phase=%d queued=%u peer=%08lx%08lx"
+                   " synced=%d t=%lu\n",
+                   ready, sender.grounded, phase, sender.count,
+                   (unsigned long)(sender.peer >> 32), (unsigned long)sender.peer,
+                   sender.clock.valid, (unsigned long)now);
             log_ms = now + HEALTH_LOG_MS;
         }
         watchdog_update();

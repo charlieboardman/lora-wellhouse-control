@@ -143,6 +143,7 @@ done
 [[ "$command_name" != test ]] || exit 0
 
 "$python" -c '
+import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -153,26 +154,29 @@ target = Path(".build/link_id.h")
 raw = os.environ.get("GW_LINK_ID", "").strip()
 
 def parse_link_id(text):
-    cleaned = text.strip().lower()
-    if cleaned.startswith("0x"):
-        cleaned = cleaned[2:]
-    if not cleaned or len(cleaned) > 16 or any(c not in "0123456789abcdef" for c in cleaned):
-        raise SystemExit(f"Invalid GW_LINK_ID \"{text}\": expected 1-16 hex digits (optional 0x prefix).")
-    value = int(cleaned, 16)
-    if value == 0:
-        raise SystemExit("Invalid GW_LINK_ID: must be non-zero.")
-    return value
+    cleaned = text.strip()
+    if not cleaned:
+        raise SystemExit("Invalid GW_LINK_ID: cannot be empty.")
+    low = cleaned.lower()
+    if low.startswith("0x") and 1 <= len(low[2:]) <= 16 and all(c in "0123456789abcdef" for c in low[2:]):
+        value = int(low[2:], 16)
+        if value == 0:
+            raise SystemExit("Invalid GW_LINK_ID: must be non-zero.")
+        return value
+    digest = hashlib.sha256(cleaned.encode("utf-8")).digest()[:8]
+    return int.from_bytes(digest, "big") or 1
 
 if command == "flash":
     if not raw:
         if not sys.stdin.isatty():
-            raise SystemExit("GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=0x... bash deploy.sh flash).")
-        raw = input("Enter shared 64-bit hex link ID (or press Enter to generate one): ").strip()
+            raise SystemExit("GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=my-well bash deploy.sh flash).")
+        raw = input("Enter shared link ID (any text, or press Enter to generate one): ").strip()
         if not raw:
             value = secrets.randbits(64) or 1
             print(f"Generated GW_LINK_ID=0x{value:016x} (use this same ID on both boards).")
         else:
             value = parse_link_id(raw)
+            print(f"Using GW_LINK_ID=0x{value:016x} (from \"{raw}\").")
     else:
         value = parse_link_id(raw)
     content = f"#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n"

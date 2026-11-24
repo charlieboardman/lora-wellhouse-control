@@ -209,11 +209,12 @@ Most operational settings are in firmware/config.h:
 SERIAL_PARITY uses 0=none, 1=odd, 2=even; SERIAL_STOP_BITS uses 1 or 2. All bus
 devices must use the configured serial settings and have distinct addresses.
 GW_LINK_ID is not hardcoded in the repository: bash deploy.sh flash prompts you
-to enter a shared 64-bit hex pair ID (or press Enter to generate one), or you
-can pass GW_LINK_ID=0x... in the environment. Both boards must be flashed with
-the same ID. It is a pair identifier, not cryptographic authentication.
-Frequency, modulation, sync word, and protocol version must also agree.
-See "Making changes" before altering radio/timing settings.
+to enter any shared link identifier (hashed to 64 bits, or a 0x... hex value,
+or press Enter to generate one), or you can pass GW_LINK_ID=... in the
+environment. Both boards must be flashed with the same ID. It is a pair
+identifier, not cryptographic authentication. Frequency, modulation, sync word,
+and protocol version must also agree. See "Making changes" before altering
+radio/timing settings.
 
 Build tools and caching
 ~~~~~~~~~~~~~~~~~~~~~~~

@@ -146,12 +146,22 @@ done
 import hashlib
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 
 command = sys.argv[1]
 target = Path(".build/link_id.h")
 raw = os.environ.get("GW_LINK_ID", "").strip()
+
+def saved_link_id():
+    if not target.is_file():
+        return None
+    text = target.read_text()
+    if "build-check only" in text:
+        return None
+    m = re.search(r"UINT64_C\(0x([0-9a-fA-F]+)\)", text)
+    return int(m.group(1), 16) if m else None
 
 def parse_link_id(text):
     cleaned = text.strip()
@@ -167,16 +177,26 @@ def parse_link_id(text):
     return int.from_bytes(digest, "big") or 1
 
 if command == "flash":
+    prev = saved_link_id()
     if not raw:
         if not sys.stdin.isatty():
             raise SystemExit("GW_LINK_ID is required for non-interactive flash (e.g. GW_LINK_ID=my-well bash deploy.sh flash).")
-        raw = input("Enter shared link ID (any text, or press Enter to generate one): ").strip()
-        if not raw:
-            value = secrets.randbits(64) or 1
-            print(f"Generated GW_LINK_ID=0x{value:016x} (use this same ID on both boards).")
+        if prev is not None:
+            raw = input(f"Enter shared link ID [Enter to reuse 0x{prev:016x}]: ").strip()
+            if not raw:
+                value = prev
+                print(f"Reusing saved GW_LINK_ID=0x{value:016x}.")
+            else:
+                value = parse_link_id(raw)
+                print(f"Using GW_LINK_ID=0x{value:016x} (from \"{raw}\").")
         else:
-            value = parse_link_id(raw)
-            print(f"Using GW_LINK_ID=0x{value:016x} (from \"{raw}\").")
+            raw = input("Enter shared link ID (any text, or press Enter to generate one): ").strip()
+            if not raw:
+                value = secrets.randbits(64) or 1
+                print(f"Generated GW_LINK_ID=0x{value:016x} (saved locally for the other board).")
+            else:
+                value = parse_link_id(raw)
+                print(f"Using GW_LINK_ID=0x{value:016x} (from \"{raw}\"; saved locally for the other board).")
     else:
         value = parse_link_id(raw)
     content = f"#pragma once\n#define GW_LINK_ID UINT64_C(0x{value:016x})\n"
@@ -198,18 +218,32 @@ if [[ "$command_name" == flash && ( "$board" == sender || "$board" == all ) ]]; 
 import getpass
 import os
 from pathlib import Path
+import re
 import sys
 
 def c_escape(s):
     return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "").replace("\r", "")
 
 target = Path(".build/wifi.h")
+saved_ssid = ""
+if target.is_file():
+    m = re.search(r"#define\s+WIFI_SSID\s+\"([^\"]*)\"", target.read_text())
+    if m:
+        saved_ssid = m.group(1)
+
 if "WIFI_SSID" in os.environ:
     ssid = os.environ["WIFI_SSID"]
     password = os.environ.get("WIFI_PASSWORD", "")
     ntp = os.environ.get("NTP_SERVER", "pool.ntp.org")
 elif sys.stdin.isatty():
-    ssid = input("Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ").strip()
+    if saved_ssid:
+        ans = input(f"Enter Wi-Fi SSID [Enter to reuse \"{saved_ssid}\", or \"-\" to skip Wi-Fi]: ").strip()
+        if not ans:
+            print(f"Reusing saved Wi-Fi credentials for \"{saved_ssid}\".")
+            raise SystemExit(0)
+        ssid = "" if ans == "-" else ans
+    else:
+        ssid = input("Enter Wi-Fi SSID (leave blank to skip Wi-Fi): ").strip()
     if ssid:
         password = getpass.getpass("Enter Wi-Fi password (leave blank for open network): ")
     else:

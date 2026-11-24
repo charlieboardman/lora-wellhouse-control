@@ -378,10 +378,29 @@ Receiver connections:
   Relay 1         GPIO1
   RGB indicator   GPIO38; green follows the commanded relay state
 
-Use the receiver's A/B terminals for the RS-485 bus and the device's documented
-bus wiring, grounding and termination arrangement. The existing RUN arrangement
-uses relay COM to VFD DCM and NO to FWD/DI1, with maintained NPN/sink two-wire
-forward/stop control. Confirm the VFD setup before connecting an actual load.
+Example VFD wiring (AutomationDirect DURApulse GS33-27P5 / GS30 series):
+
+  Note: this wiring and serial profile is specific to the GS33-27P5 (GS30
+  series). Other VFDs use different terminal labels, RS-485 A/B polarity
+  conventions, RUN input logic (NPN/sink vs. PNP/source, 2-wire vs. 3-wire),
+  and default Modbus serial settings. Always verify against your VFD manual
+  before wiring or connecting a motor load.
+
+  RS-485 (receiver isolated RS-485 terminal block -> VFD):
+    A (A+)         -> SG+  (or RJ45 pin 5)
+    B (B-)         -> SG-  (or RJ45 pin 4)
+    RS-485 GND     -> SGND (or RJ45 pin 3/7)
+      Connect the GND terminal on the receiver's isolated RS-485 block, not the
+      board's main power GND, so the transceiver gets a common-mode reference
+      without creating a ground loop.
+
+  Pump RUN (receiver Relay 1 -> VFD):
+    Relay 1 COM    -> DCM
+    Relay 1 NO     -> FWD / DI1 (NPN/sink maintained two-wire forward/stop)
+
+  GS30 factory Modbus RTU defaults (already match firmware/config.h):
+    P09.00 = 1 (slave address), P09.01 = 9.6 (9600 baud), P09.04 = 15 (8O1 RTU).
+    If initial reads time out on another drive, swapping A and B is harmless.
 
 Flashing is an explicit operation. Isolate the pump RUN circuit for initial
 checkout; do not flash or exercise relays with an operating pump connected.

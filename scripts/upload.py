@@ -189,8 +189,11 @@ def upload_receiver(root, build, port='', expected_mac=None):
         if mac not in identity.stdout.lower():
             raise RuntimeError('Wrong receiver; refusing to flash: ' + identity.stdout)
     else:
-        print(f'Detected ESP32-S3 receiver on {port}:\n{identity.stdout.strip()}')
-        answer = input('Flash this receiver? [y/N]: ').strip().lower()
+        mac_lines = [line.strip() for line in identity.stdout.splitlines() if 'mac:' in line.lower()]
+        summary = mac_lines[0] if mac_lines else identity.stdout.strip()
+        print(f'\nDetected ESP32-S3 receiver on {port} ({summary})', flush=True)
+        print('>>> Type y and press Enter to flash this receiver (anything else cancels): ', end='', flush=True)
+        answer = input().strip().lower()
         if answer not in ('y', 'yes'):
             raise RuntimeError('Receiver flash cancelled by user')
     backups = root / '.backups'
@@ -198,6 +201,7 @@ def upload_receiver(root, build, port='', expected_mac=None):
     (backups / 'receiver-identity.txt').write_text(identity.stdout)
     backup = backups / 'receiver-before.bin'
     if not backup.exists():
+        print('Backing up 16 MiB receiver flash to .backups/receiver-before.bin (one-time, ~1-2 min)...', flush=True)
         subprocess.run(base + ['--after', 'no-reset', '--baud', '921600', 'read-flash',
                                '0', 'ALL', str(backup)], check=True, timeout=180)
     if backup.stat().st_size != 16777216:
